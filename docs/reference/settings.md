@@ -1073,6 +1073,32 @@ Whether to enable experimental, preview features.
 
 ---
 
+### [`publish-url`](#publish-url) {: #publish-url }
+
+The URL for publishing packages to the Python package index (by default:
+<https://upload.pypi.org/legacy>).
+
+**Default value**: `"https://upload.pypi.org/legacy"`
+
+**Type**: `str`
+
+**Example usage**:
+
+=== "pyproject.toml"
+
+    ```toml
+    [tool.uv]
+    index-url = "https://test.pypi.org/simple"
+    ```
+=== "uv.toml"
+
+    ```toml
+    
+    index-url = "https://test.pypi.org/simple"
+    ```
+
+---
+
 ### [`python-downloads`](#python-downloads) {: #python-downloads }
 
 Whether to allow Python downloads.

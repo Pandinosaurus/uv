@@ -1,10 +1,7 @@
 # Publishing a package
 
-uv supports building Python packages into source and binary distributions via `uv build`.
-
-As uv does not yet have a dedicated command for publishing packages, you can use the PyPA tool
-[`twine`](https://github.com/pypa/twine) to upload your package to a package registry, which can be
-invoked via `uvx`.
+uv supports building Python packages into source and binary distributions via `uv build` and
+uploading them to a registry with `uv publish`.
 
 ## Preparing your project for packaging
 
@@ -32,15 +29,15 @@ Alternatively, `uv build <SRC>` will build the package in the specified director
 
 ## Publishing your package
 
-Publish your package with `twine`:
+Publish your package with `uv publish`:
 
 ```console
-$ uvx twine upload dist/*
+$ uv publish
 ```
 
 !!! tip
 
-    To provide credentials, use the `TWINE_USERNAME` and `TWINE_PASSWORD` environment variables.
+    To provide credentials, use the `UV_PUBLISH_USERNAME` and `UV_PUBLISH_PASSWORD` environment variables.
 
 ## Installing your package
 
