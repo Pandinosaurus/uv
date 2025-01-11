@@ -1,8 +1,8 @@
 use std::convert::Infallible;
 
-use pubgrub::{Dependencies, DependencyProvider, Range};
+use pubgrub::{Dependencies, DependencyProvider, PackageResolutionStatistics, Range};
 
-use pep440_rs::Version;
+use uv_pep440::Version;
 
 use crate::pubgrub::{PubGrubPackage, PubGrubPriority};
 use crate::resolver::UnavailableReason;
@@ -17,13 +17,18 @@ impl DependencyProvider for UvDependencyProvider {
     type V = Version;
     type VS = Range<Version>;
     type M = UnavailableReason;
+    /// Main priority and tiebreak for virtual packages
+    type Priority = (Option<PubGrubPriority>, u32);
+    type Err = Infallible;
 
-    fn prioritize(&self, _package: &Self::P, _range: &Self::VS) -> Self::Priority {
+    fn prioritize(
+        &self,
+        _package: &Self::P,
+        _range: &Self::VS,
+        _stats: &PackageResolutionStatistics,
+    ) -> Self::Priority {
         unimplemented!()
     }
-    type Priority = Option<PubGrubPriority>;
-
-    type Err = Infallible;
 
     fn choose_version(
         &self,

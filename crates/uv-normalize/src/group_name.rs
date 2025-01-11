@@ -3,8 +3,9 @@ use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 use std::sync::LazyLock;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::small_string::SmallString;
 use crate::{validate_and_normalize_owned, validate_and_normalize_ref, InvalidNameError};
 
 /// The normalized name of a dependency group.
@@ -12,9 +13,9 @@ use crate::{validate_and_normalize_owned, validate_and_normalize_ref, InvalidNam
 /// See:
 /// - <https://peps.python.org/pep-0735/>
 /// - <https://packaging.python.org/en/latest/specifications/name-normalization/>
-#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-pub struct GroupName(String);
+pub struct GroupName(SmallString);
 
 impl GroupName {
     /// Create a validated, normalized group name.
@@ -38,6 +39,15 @@ impl<'de> Deserialize<'de> for GroupName {
     {
         let s = String::deserialize(deserializer)?;
         Self::from_str(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for GroupName {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
     }
 }
 

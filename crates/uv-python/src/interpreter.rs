@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::env::consts::ARCH;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -11,21 +12,24 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{trace, warn};
 
-use cache_key::cache_digest;
-use install_wheel_rs::Layout;
-use pep440_rs::Version;
-use pep508_rs::{MarkerEnvironment, StringVersion};
-use platform_tags::Platform;
-use platform_tags::{Tags, TagsError};
-use pypi_types::{ResolverMarkerEnvironment, Scheme};
 use uv_cache::{Cache, CacheBucket, CachedByTimestamp, Freshness};
 use uv_cache_info::Timestamp;
+use uv_cache_key::cache_digest;
 use uv_fs::{write_atomic_sync, PythonExt, Simplified};
+use uv_install_wheel::Layout;
+use uv_pep440::Version;
+use uv_pep508::{MarkerEnvironment, StringVersion};
+use uv_platform_tags::Platform;
+use uv_platform_tags::{Tags, TagsError};
+use uv_pypi_types::{ResolverMarkerEnvironment, Scheme};
 
 use crate::implementation::LenientImplementationName;
 use crate::platform::{Arch, Libc, Os};
 use crate::pointer_size::PointerSize;
-use crate::{Prefix, PythonInstallationKey, PythonVersion, Target, VirtualEnvironment};
+use crate::{
+    Prefix, PythonInstallationKey, PythonVariant, PythonVersion, Target, VersionRequest,
+    VirtualEnvironment,
+};
 
 /// A Python executable and its associated platform markers.
 #[derive(Debug, Clone)]
@@ -42,6 +46,7 @@ pub struct Interpreter {
     sys_executable: PathBuf,
     sys_path: Vec<PathBuf>,
     stdlib: PathBuf,
+    standalone: bool,
     tags: OnceLock<Tags>,
     target: Option<Target>,
     prefix: Option<Prefix>,
@@ -75,6 +80,7 @@ impl Interpreter {
             sys_executable: info.sys_executable,
             sys_path: info.sys_path,
             stdlib: info.stdlib,
+            standalone: info.standalone,
             tags: OnceLock::new(),
             target: None,
             prefix: None,
@@ -144,7 +150,7 @@ impl Interpreter {
     }
 
     /// Return the [`ResolverMarkerEnvironment`] for this Python executable.
-    pub fn resolver_markers(&self) -> ResolverMarkerEnvironment {
+    pub fn resolver_marker_environment(&self) -> ResolverMarkerEnvironment {
         ResolverMarkerEnvironment::from(self.markers().clone())
     }
 
@@ -155,14 +161,20 @@ impl Interpreter {
             self.python_major(),
             self.python_minor(),
             self.python_patch(),
-            self.python_version()
-                .pre()
-                .map(|pre| pre.to_string())
-                .unwrap_or_default(),
+            self.python_version().pre(),
             self.os(),
             self.arch(),
             self.libc(),
+            self.variant(),
         )
+    }
+
+    pub fn variant(&self) -> PythonVariant {
+        if self.gil_disabled() {
+            PythonVariant::Freethreaded
+        } else {
+            PythonVariant::default()
+        }
     }
 
     /// Return the [`Arch`] reported by the interpreter platform tags.
@@ -415,6 +427,18 @@ impl Interpreter {
         self.prefix.as_ref()
     }
 
+    /// Returns `true` if an [`Interpreter`] may be a `python-build-standalone` interpreter.
+    ///
+    /// This method may return false positives, but it should not return false negatives. In other
+    /// words, if this method returns `true`, the interpreter _may_ be from
+    /// `python-build-standalone`; if it returns `false`, the interpreter is definitely _not_ from
+    /// `python-build-standalone`.
+    ///
+    /// See: <https://github.com/astral-sh/python-build-standalone/issues/382>
+    pub fn is_standalone(&self) -> bool {
+        self.standalone
+    }
+
     /// Return the [`Layout`] environment used to install wheels into this interpreter.
     pub fn layout(&self) -> Layout {
         Layout {
@@ -494,6 +518,21 @@ impl Interpreter {
             (version.major(), version.minor()) == self.python_tuple()
         }
     }
+
+    /// Whether or not this Python interpreter is from a default Python executable name, like
+    /// `python`, `python3`, or `python.exe`.
+    pub(crate) fn has_default_executable_name(&self) -> bool {
+        let Some(file_name) = self.sys_executable().file_name() else {
+            return false;
+        };
+        let Some(name) = file_name.to_str() else {
+            return false;
+        };
+        VersionRequest::Default
+            .executable_names(None)
+            .into_iter()
+            .any(|default_name| name == default_name.to_string())
+    }
 }
 
 /// The `EXTERNALLY-MANAGED` file in a Python installation.
@@ -559,7 +598,7 @@ enum InterpreterInfoResult {
 pub enum InterpreterInfoError {
     #[error("Could not detect a glibc or a musl libc (while running on Linux)")]
     LibcNotFound,
-    #[error("Unknown operation system: `{operating_system}`")]
+    #[error("Unknown operating system: `{operating_system}`")]
     UnknownOperatingSystem { operating_system: String },
     #[error("Python {python_version} is not supported. Please use Python 3.8 or newer.")]
     UnsupportedPythonVersion { python_version: String },
@@ -581,6 +620,7 @@ struct InterpreterInfo {
     sys_executable: PathBuf,
     sys_path: Vec<PathBuf>,
     stdlib: PathBuf,
+    standalone: bool,
     pointer_size: PointerSize,
     gil_disabled: bool,
 }
@@ -599,7 +639,8 @@ impl InterpreterInfo {
             tempdir.path().escape_for_python()
         );
         let output = Command::new(interpreter)
-            .arg("-I")
+            .arg("-I") // Isolated mode.
+            .arg("-B") // Don't write bytecode.
             .arg("-c")
             .arg(script)
             .output()
@@ -700,7 +741,9 @@ impl InterpreterInfo {
 
         let cache_entry = cache.entry(
             CacheBucket::Interpreter,
-            "",
+            // Shard interpreter metadata by host architecture, to avoid cache collisions when
+            // running universal binaries under Rosetta.
+            ARCH,
             // We use the absolute path for the cache entry to avoid cache collisions for relative
             // paths. But we don't to query the executable with symbolic links resolved.
             format!("{}.msgpack", cache_digest(&absolute)),
@@ -784,8 +827,8 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use tempfile::tempdir;
 
-    use pep440_rs::Version;
     use uv_cache::Cache;
+    use uv_pep440::Version;
 
     use crate::Interpreter;
 
@@ -794,66 +837,67 @@ mod tests {
         let mock_dir = tempdir().unwrap();
         let mocked_interpreter = mock_dir.path().join("python");
         let json = indoc! {r##"
-            {
-                "result": "success",
-                "platform": {
-                    "os": {
-                        "name": "manylinux",
-                        "major": 2,
-                        "minor": 38
-                    },
-                    "arch": "x86_64"
+        {
+            "result": "success",
+            "platform": {
+                "os": {
+                    "name": "manylinux",
+                    "major": 2,
+                    "minor": 38
                 },
-                "manylinux_compatible": false,
-                "markers": {
-                    "implementation_name": "cpython",
-                    "implementation_version": "3.12.0",
-                    "os_name": "posix",
-                    "platform_machine": "x86_64",
-                    "platform_python_implementation": "CPython",
-                    "platform_release": "6.5.0-13-generic",
-                    "platform_system": "Linux",
-                    "platform_version": "#13-Ubuntu SMP PREEMPT_DYNAMIC Fri Nov  3 12:16:05 UTC 2023",
-                    "python_full_version": "3.12.0",
-                    "python_version": "3.12",
-                    "sys_platform": "linux"
-                },
-                "sys_base_exec_prefix": "/home/ferris/.pyenv/versions/3.12.0",
-                "sys_base_prefix": "/home/ferris/.pyenv/versions/3.12.0",
-                "sys_prefix": "/home/ferris/projects/uv/.venv",
-                "sys_executable": "/home/ferris/projects/uv/.venv/bin/python",
-                "sys_path": [
-                    "/home/ferris/.pyenv/versions/3.12.0/lib/python3.12/lib/python3.12",
-                    "/home/ferris/.pyenv/versions/3.12.0/lib/python3.12/site-packages"
-                ],
-                "stdlib": "/home/ferris/.pyenv/versions/3.12.0/lib/python3.12",
-                "scheme": {
-                    "data": "/home/ferris/.pyenv/versions/3.12.0",
-                    "include": "/home/ferris/.pyenv/versions/3.12.0/include",
-                    "platlib": "/home/ferris/.pyenv/versions/3.12.0/lib/python3.12/site-packages",
-                    "purelib": "/home/ferris/.pyenv/versions/3.12.0/lib/python3.12/site-packages",
-                    "scripts": "/home/ferris/.pyenv/versions/3.12.0/bin"
-                },
-                "virtualenv": {
-                    "data": "",
-                    "include": "include",
-                    "platlib": "lib/python3.12/site-packages",
-                    "purelib": "lib/python3.12/site-packages",
-                    "scripts": "bin"
-                },
-                "pointer_size": "64",
-                "gil_disabled": true
-            }
-        "##};
+                "arch": "x86_64"
+            },
+            "manylinux_compatible": false,
+            "standalone": false,
+            "markers": {
+                "implementation_name": "cpython",
+                "implementation_version": "3.12.0",
+                "os_name": "posix",
+                "platform_machine": "x86_64",
+                "platform_python_implementation": "CPython",
+                "platform_release": "6.5.0-13-generic",
+                "platform_system": "Linux",
+                "platform_version": "#13-Ubuntu SMP PREEMPT_DYNAMIC Fri Nov  3 12:16:05 UTC 2023",
+                "python_full_version": "3.12.0",
+                "python_version": "3.12",
+                "sys_platform": "linux"
+            },
+            "sys_base_exec_prefix": "/home/ferris/.pyenv/versions/3.12.0",
+            "sys_base_prefix": "/home/ferris/.pyenv/versions/3.12.0",
+            "sys_prefix": "/home/ferris/projects/uv/.venv",
+            "sys_executable": "/home/ferris/projects/uv/.venv/bin/python",
+            "sys_path": [
+                "/home/ferris/.pyenv/versions/3.12.0/lib/python3.12/lib/python3.12",
+                "/home/ferris/.pyenv/versions/3.12.0/lib/python3.12/site-packages"
+            ],
+            "stdlib": "/home/ferris/.pyenv/versions/3.12.0/lib/python3.12",
+            "scheme": {
+                "data": "/home/ferris/.pyenv/versions/3.12.0",
+                "include": "/home/ferris/.pyenv/versions/3.12.0/include",
+                "platlib": "/home/ferris/.pyenv/versions/3.12.0/lib/python3.12/site-packages",
+                "purelib": "/home/ferris/.pyenv/versions/3.12.0/lib/python3.12/site-packages",
+                "scripts": "/home/ferris/.pyenv/versions/3.12.0/bin"
+            },
+            "virtualenv": {
+                "data": "",
+                "include": "include",
+                "platlib": "lib/python3.12/site-packages",
+                "purelib": "lib/python3.12/site-packages",
+                "scripts": "bin"
+            },
+            "pointer_size": "64",
+            "gil_disabled": true
+        }
+    "##};
 
         let cache = Cache::temp().unwrap().init().unwrap();
 
         fs::write(
             &mocked_interpreter,
             formatdoc! {r##"
-            #!/bin/bash
-            echo '{json}'
-            "##},
+        #!/bin/bash
+        echo '{json}'
+        "##},
         )
         .unwrap();
 
@@ -870,9 +914,9 @@ mod tests {
         fs::write(
             &mocked_interpreter,
             formatdoc! {r##"
-            #!/bin/bash
-            echo '{}'
-            "##, json.replace("3.12", "3.13")},
+        #!/bin/bash
+        echo '{}'
+        "##, json.replace("3.12", "3.13")},
         )
         .unwrap();
         let interpreter = Interpreter::query(&mocked_interpreter, &cache).unwrap();

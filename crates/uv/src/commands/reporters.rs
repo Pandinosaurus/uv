@@ -7,11 +7,14 @@ use owo_colors::OwoColorize;
 use rustc_hash::FxHashMap;
 use url::Url;
 
-use distribution_types::{
+use uv_cache::Removal;
+use uv_distribution_types::{
     BuildableSource, CachedDist, DistributionMetadata, Name, SourceDist, VersionOrUrlRef,
 };
 use uv_normalize::PackageName;
+use uv_pep440::Version;
 use uv_python::PythonInstallationKey;
+use uv_static::EnvVars;
 
 use crate::printer::Printer;
 
@@ -55,7 +58,7 @@ impl BarState {
 
 impl ProgressReporter {
     fn new(root: ProgressBar, multi_progress: MultiProgress, printer: Printer) -> ProgressReporter {
-        let mode = if env::var("JPY_SESSION_NAME").is_ok() {
+        let mode = if env::var(EnvVars::JPY_SESSION_NAME).is_ok() {
             // Disable concurrent progress bars when running inside a Jupyter notebook
             // because the Jupyter terminal does not support clearing previous lines.
             // See: https://github.com/astral-sh/uv/issues/3887.
@@ -143,9 +146,10 @@ impl ProgressReporter {
         );
 
         if size.is_some() {
+            // We're using binary bytes to match `human_readable_bytes`.
             progress.set_style(
                 ProgressStyle::with_template(
-                    "{msg:10.dim} {bar:30.green/dim} {decimal_bytes:>7}/{decimal_total_bytes:7}",
+                    "{msg:10.dim} {bar:30.green/dim} {binary_bytes:>7}/{binary_total_bytes:7}",
                 )
                 .unwrap()
                 .progress_chars("--"),
@@ -482,6 +486,145 @@ impl uv_python::downloads::Reporter for PythonDownloadReporter {
     fn on_download_complete(&self) {
         self.reporter.root.set_message("");
         self.reporter.root.finish_and_clear();
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct PublishReporter {
+    reporter: ProgressReporter,
+}
+
+impl PublishReporter {
+    /// Initialize a [`PublishReporter`] for a single upload.
+    pub(crate) fn single(printer: Printer) -> Self {
+        Self::new(printer, 1)
+    }
+
+    /// Initialize a [`PublishReporter`] for multiple uploads.
+    pub(crate) fn new(printer: Printer, length: u64) -> Self {
+        let multi_progress = MultiProgress::with_draw_target(printer.target());
+        let root = multi_progress.add(ProgressBar::with_draw_target(
+            Some(length),
+            printer.target(),
+        ));
+        let reporter = ProgressReporter::new(root, multi_progress, printer);
+        Self { reporter }
+    }
+}
+
+impl uv_publish::Reporter for PublishReporter {
+    fn on_progress(&self, _name: &str, id: usize) {
+        self.reporter.on_download_complete(id);
+    }
+
+    fn on_download_start(&self, name: &str, size: Option<u64>) -> usize {
+        self.reporter.on_download_start(name.to_string(), size)
+    }
+
+    fn on_download_progress(&self, id: usize, inc: u64) {
+        self.reporter.on_download_progress(id, inc);
+    }
+
+    fn on_download_complete(&self, id: usize) {
+        self.reporter.on_download_complete(id);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct LatestVersionReporter {
+    progress: ProgressBar,
+}
+
+impl From<Printer> for LatestVersionReporter {
+    fn from(printer: Printer) -> Self {
+        let progress = ProgressBar::with_draw_target(None, printer.target());
+        progress.set_style(
+            ProgressStyle::with_template("{bar:20} [{pos}/{len}] {wide_msg:.dim}").unwrap(),
+        );
+        progress.set_message("Fetching latest versions...");
+        Self { progress }
+    }
+}
+
+impl LatestVersionReporter {
+    #[must_use]
+    pub(crate) fn with_length(self, length: u64) -> Self {
+        self.progress.set_length(length);
+        self
+    }
+
+    pub(crate) fn on_fetch_progress(&self) {
+        self.progress.inc(1);
+    }
+
+    pub(crate) fn on_fetch_version(&self, name: &PackageName, version: &Version) {
+        self.progress.set_message(format!("{name} v{version}"));
+        self.progress.inc(1);
+    }
+
+    pub(crate) fn on_fetch_complete(&self) {
+        self.progress.set_message("");
+        self.progress.finish_and_clear();
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CleaningDirectoryReporter {
+    bar: ProgressBar,
+}
+
+impl CleaningDirectoryReporter {
+    /// Initialize a [`CleaningDirectoryReporter`] for cleaning the cache directory.
+    pub(crate) fn new(printer: Printer, max: usize) -> Self {
+        let bar = ProgressBar::with_draw_target(Some(max as u64), printer.target());
+        bar.set_style(
+            ProgressStyle::with_template("{prefix} [{bar:20}] {percent}%")
+                .unwrap()
+                .progress_chars("=> "),
+        );
+        bar.set_prefix(format!("{}", "Cleaning".bold().cyan()));
+        Self { bar }
+    }
+}
+
+impl uv_cache::CleanReporter for CleaningDirectoryReporter {
+    fn on_clean(&self) {
+        self.bar.inc(1);
+    }
+
+    fn on_complete(&self) {
+        self.bar.finish_and_clear();
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct CleaningPackageReporter {
+    bar: ProgressBar,
+}
+
+impl CleaningPackageReporter {
+    /// Initialize a [`CleaningPackageReporter`] for cleaning packages from the cache.
+    pub(crate) fn new(printer: Printer, max: usize) -> Self {
+        let bar = ProgressBar::with_draw_target(Some(max as u64), printer.target());
+        bar.set_style(
+            ProgressStyle::with_template("{prefix} [{bar:20}] {pos}/{len}{msg}")
+                .unwrap()
+                .progress_chars("=> "),
+        );
+        bar.set_prefix(format!("{}", "Cleaning".bold().cyan()));
+        Self { bar }
+    }
+
+    pub(crate) fn on_clean(&self, package: &str, removal: &Removal) {
+        self.bar.inc(1);
+        self.bar.set_message(format!(
+            ": {}, {} files {} folders removed",
+            package, removal.num_files, removal.num_dirs,
+        ));
+    }
+
+    pub(crate) fn on_complete(&self) {
+        self.bar.finish_and_clear();
     }
 }
 

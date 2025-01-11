@@ -3,15 +3,15 @@
 //! This module reads all fields exhaustively. The fields are defined in the [Core metadata
 //! specification](https://packaging.python.org/en/latest/specifications/core-metadata/).
 
-use distribution_filename::WheelFilename;
-use pypi_types::Metadata23;
 use std::io;
 use std::io::{Read, Seek};
 use std::path::Path;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use uv_distribution_filename::WheelFilename;
 use uv_normalize::{DistInfoName, InvalidNameError};
+use uv_pypi_types::ResolutionMetadata;
 use zip::ZipArchive;
 
 /// The caller is responsible for attaching the path or url we failed to read.
@@ -32,7 +32,7 @@ pub enum Error {
     #[error("The .dist-info directory name contains invalid characters")]
     InvalidName(#[from] InvalidNameError),
     #[error("The metadata at {0} is invalid")]
-    InvalidMetadata(String, Box<pypi_types::MetadataError>),
+    InvalidMetadata(String, Box<uv_pypi_types::MetadataError>),
     #[error("Failed to read from zip file")]
     Zip(#[from] zip::result::ZipError),
     #[error("Failed to read from zip file")]
@@ -233,7 +233,7 @@ pub async fn read_metadata_async_stream<R: futures::AsyncRead + Unpin>(
     filename: &WheelFilename,
     debug_path: &str,
     reader: R,
-) -> Result<Metadata23, Error> {
+) -> Result<ResolutionMetadata, Error> {
     let reader = futures::io::BufReader::with_capacity(128 * 1024, reader);
     let mut zip = async_zip::base::read::stream::ZipFileReader::new(reader);
 
@@ -246,7 +246,7 @@ pub async fn read_metadata_async_stream<R: futures::AsyncRead + Unpin>(
             let mut contents = Vec::new();
             reader.read_to_end(&mut contents).await.unwrap();
 
-            let metadata = Metadata23::parse_metadata(&contents)
+            let metadata = ResolutionMetadata::parse_metadata(&contents)
                 .map_err(|err| Error::InvalidMetadata(debug_path.to_string(), Box::new(err)))?;
             return Ok(metadata);
         }
@@ -259,14 +259,14 @@ pub async fn read_metadata_async_stream<R: futures::AsyncRead + Unpin>(
     Err(Error::MissingDistInfo)
 }
 
-/// Read the [`Metadata23`] from an unzipped wheel.
+/// Read the [`ResolutionMetadata`] from an unzipped wheel.
 pub fn read_flat_wheel_metadata(
     filename: &WheelFilename,
     wheel: impl AsRef<Path>,
-) -> Result<Metadata23, Error> {
+) -> Result<ResolutionMetadata, Error> {
     let dist_info_prefix = find_flat_dist_info(filename, &wheel)?;
     let metadata = read_dist_info_metadata(&dist_info_prefix, &wheel)?;
-    Metadata23::parse_metadata(&metadata).map_err(|err| {
+    ResolutionMetadata::parse_metadata(&metadata).map_err(|err| {
         Error::InvalidMetadata(
             format!("{dist_info_prefix}.dist-info/METADATA"),
             Box::new(err),
@@ -277,8 +277,8 @@ pub fn read_flat_wheel_metadata(
 #[cfg(test)]
 mod test {
     use super::find_archive_dist_info;
-    use distribution_filename::WheelFilename;
     use std::str::FromStr;
+    use uv_distribution_filename::WheelFilename;
 
     #[test]
     fn test_dot_in_name() {

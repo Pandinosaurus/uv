@@ -4,10 +4,14 @@ version = "0.0.1"
 edition = "2021"
 description = "Normalization for distribution, package and extra names."
 
+[lib]
+doctest = false
+
 [lints]
 workspace = true
 
 [dependencies]
+arcstr = { workspace = true }
 rkyv = { workspace = true }
 schemars = { workspace = true, optional = true }
 serde = { workspace = true, features = ["derive"] }

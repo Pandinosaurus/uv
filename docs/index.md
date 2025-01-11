@@ -16,17 +16,18 @@ An extremely fast Python package and project manager, written in Rust.
 
 ## Highlights
 
-- 🚀 A single tool to replace `pip`, `pip-tools`, `pipx`, `poetry`, `pyenv`, `virtualenv`, and more.
+- 🚀 A single tool to replace `pip`, `pip-tools`, `pipx`, `poetry`, `pyenv`, `twine`, `virtualenv`,
+  and more.
 - ⚡️ [10-100x faster](https://github.com/astral-sh/uv/blob/main/BENCHMARKS.md) than `pip`.
 - 🐍 [Installs and manages](#python-management) Python versions.
 - 🛠️ [Runs and installs](#tool-management) Python applications.
 - ❇️ [Runs scripts](#script-support), with support for
   [inline dependency metadata](./guides/scripts.md#declaring-script-dependencies).
 - 🗂️ Provides [comprehensive project management](#project-management), with a
-  [universal lockfile](./concepts/projects.md#project-lockfile).
+  [universal lockfile](./concepts/projects/layout.md#the-lockfile).
 - 🔩 Includes a [pip-compatible interface](#the-pip-interface) for a performance boost with a
   familiar CLI.
-- 🏢 Supports Cargo-style [workspaces](./concepts/workspaces.md) for scalable projects.
+- 🏢 Supports Cargo-style [workspaces](./concepts/projects/workspaces.md) for scalable projects.
 - 💾 Disk-space efficient, with a [global cache](./concepts/cache.md) for dependency deduplication.
 - ⏬ Installable without Rust or Python via `curl` or `pip`.
 - 🖥️ Supports macOS, Linux, and Windows.
@@ -69,7 +70,7 @@ Initialized project `example` at `/home/user/example`
 $ cd example
 
 $ uv add ruff
-Creating virtualenv at: .venv
+Creating virtual environment at: .venv
 Resolved 2 packages in 170ms
    Built example @ file:///home/user/example
 Prepared 2 packages in 627ms
@@ -82,6 +83,9 @@ All checks passed!
 ```
 
 See the [project guide](./guides/projects.md) to get started.
+
+uv also supports building and publishing projects, even if they're not managed with uv. See the
+[publish guide](./guides/publish.md) to learn more.
 
 ## Tool management
 
@@ -142,11 +146,11 @@ Download Python versions as needed:
 
 ```console
 $ uv venv --python 3.12.0
-Using Python 3.12.0
-Creating virtualenv at: .venv
+Using CPython 3.12.0
+Creating virtual environment at: .venv
 Activate with: source .venv/bin/activate
 
-$ uv run --python pypy@3.8 -- python --version
+$ uv run --python pypy@3.8 -- python
 Python 3.8.16 (a9dbdca6fc3286b0addd2240f11d97d8e8de187a, Dec 29 2022, 11:45:30)
 [PyPy 7.3.11 with GCC Apple LLVM 13.1.6 (clang-1316.0.21.2.5)] on darwin
 Type "help", "copyright", "credits" or "license" for more information.
@@ -156,13 +160,13 @@ Type "help", "copyright", "credits" or "license" for more information.
 Use a specific Python version in the current directory:
 
 ```console
-$ uv python pin pypy@3.11
-Pinned `.python-version` to `pypy@3.11`
+$ uv python pin 3.11
+Pinned `.python-version` to `3.11`
 ```
 
 See the [installing Python guide](./guides/install-python.md) to get started.
 
-### Script support
+## Script support
 
 uv manages dependencies and environments for single-file scripts.
 
@@ -210,8 +214,8 @@ Create a virtual environment:
 
 ```console
 $ uv venv
-Using Python 3.12.3
-Creating virtualenv at: .venv
+Using CPython 3.12.3
+Creating virtual environment at: .venv
 Activate with: source .venv/bin/activate
 ```
 
