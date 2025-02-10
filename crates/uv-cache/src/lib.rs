@@ -10,15 +10,16 @@ use rustc_hash::FxHashSet;
 use tracing::debug;
 
 pub use archive::ArchiveId;
-use distribution_types::InstalledDist;
-use pypi_types::Metadata23;
 use uv_cache_info::Timestamp;
-use uv_fs::{cachedir, directories};
+use uv_distribution_types::InstalledDist;
+use uv_fs::{cachedir, directories, LockedFile};
 use uv_normalize::PackageName;
+use uv_pypi_types::ResolutionMetadata;
 
 pub use crate::by_timestamp::CachedByTimestamp;
 #[cfg(feature = "clap")]
 pub use crate::cli::CacheArgs;
+use crate::removal::Remover;
 pub use crate::removal::{rm_rf, Removal};
 pub use crate::wheel::WheelCache;
 use crate::wheel::WheelCacheKind;
@@ -45,6 +46,11 @@ impl CacheEntry {
         Self(path.into())
     }
 
+    /// Return the cache entry's parent directory.
+    pub fn shard(&self) -> CacheShard {
+        CacheShard(self.dir().to_path_buf())
+    }
+
     /// Convert the [`CacheEntry`] into a [`PathBuf`].
     #[inline]
     pub fn into_path_buf(self) -> PathBuf {
@@ -68,6 +74,12 @@ impl CacheEntry {
     pub fn with_file(&self, file: impl AsRef<Path>) -> Self {
         Self(self.dir().join(file))
     }
+
+    /// Acquire the [`CacheEntry`] as an exclusive lock.
+    pub async fn lock(&self) -> Result<LockedFile, io::Error> {
+        fs_err::create_dir_all(self.dir())?;
+        LockedFile::acquire(self.path(), self.path().display()).await
+    }
 }
 
 impl AsRef<Path> for CacheEntry {
@@ -90,6 +102,12 @@ impl CacheShard {
     #[must_use]
     pub fn shard(&self, dir: impl AsRef<Path>) -> Self {
         Self(self.0.join(dir.as_ref()))
+    }
+
+    /// Acquire the cache entry as an exclusive lock.
+    pub async fn lock(&self) -> Result<LockedFile, io::Error> {
+        fs_err::create_dir_all(self.as_ref())?;
+        LockedFile::acquire(self.join(".lock"), self.display()).await
     }
 }
 
@@ -182,8 +200,14 @@ impl Cache {
         self.bucket(CacheBucket::Archive).join(id)
     }
 
-    /// Create an ephemeral Python environment in the cache.
-    pub fn environment(&self) -> io::Result<tempfile::TempDir> {
+    /// Create a temporary directory to be used as a Python virtual environment.
+    pub fn venv_dir(&self) -> io::Result<tempfile::TempDir> {
+        fs_err::create_dir_all(self.bucket(CacheBucket::Builds))?;
+        tempfile::tempdir_in(self.bucket(CacheBucket::Builds))
+    }
+
+    /// Create a temporary directory to be used for executing PEP 517 source distribution builds.
+    pub fn build_dir(&self) -> io::Result<tempfile::TempDir> {
         fs_err::create_dir_all(self.bucket(CacheBucket::Builds))?;
         tempfile::tempdir_in(self.bucket(CacheBucket::Builds))
     }
@@ -315,8 +339,8 @@ impl Cache {
     }
 
     /// Clear the cache, removing all entries.
-    pub fn clear(&self) -> Result<Removal, io::Error> {
-        rm_rf(&self.root)
+    pub fn clear(&self, reporter: Box<dyn CleanReporter>) -> Result<Removal, io::Error> {
+        Remover::new(reporter).rm_rf(&self.root)
     }
 
     /// Remove a package from the cache.
@@ -512,6 +536,14 @@ impl Cache {
     }
 }
 
+pub trait CleanReporter: Send + Sync {
+    /// Called after one file or directory is removed.
+    fn on_clean(&self);
+
+    /// Called after all files and directories are removed.
+    fn on_complete(&self);
+}
+
 /// The different kinds of data in the cache are stored in different bucket, which in our case
 /// are subdirectories of the cache root.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -626,7 +658,7 @@ pub enum CacheBucket {
     /// can put next to the wheels as in the `Wheels` bucket.
     ///
     /// The unzipped source distribution is stored in a directory matching the source distribution
-    /// acrhive name.
+    /// archive name.
     ///
     /// Source distributions are built into zipped wheel files (as PEP 517 specifies) and unzipped
     /// lazily before installing. So when resolving, we only build the wheel and store the archive
@@ -759,15 +791,18 @@ pub enum CacheBucket {
 impl CacheBucket {
     fn to_str(self) -> &'static str {
         match self {
-            // Note, next time we change the version we should change the name of this bucket to `source-dists-v0`
-            Self::SourceDistributions => "built-wheels-v3",
-            Self::FlatIndex => "flat-index-v0",
+            // Note that when bumping this, you'll also need to bump it
+            // in crates/uv/tests/cache_prune.rs.
+            Self::SourceDistributions => "sdists-v7",
+            Self::FlatIndex => "flat-index-v2",
             Self::Git => "git-v0",
-            Self::Interpreter => "interpreter-v2",
+            Self::Interpreter => "interpreter-v4",
             // Note that when bumping this, you'll also need to bump it
             // in crates/uv/tests/cache_clean.rs.
-            Self::Simple => "simple-v12",
-            Self::Wheels => "wheels-v1",
+            Self::Simple => "simple-v15",
+            // Note that when bumping this, you'll also need to bump it
+            // in crates/uv/tests/cache_prune.rs.
+            Self::Wheels => "wheels-v3",
             Self::Archive => "archive-v0",
             Self::Builds => "builds-v0",
             Self::Environments => "environments-v1",
@@ -783,7 +818,7 @@ impl CacheBucket {
             let Ok(metadata) = fs_err::read(path.join("metadata.msgpack")) else {
                 return false;
             };
-            let Ok(metadata) = rmp_serde::from_slice::<Metadata23>(&metadata) else {
+            let Ok(metadata) = rmp_serde::from_slice::<ResolutionMetadata>(&metadata) else {
                 return false;
             };
             metadata.name == *name

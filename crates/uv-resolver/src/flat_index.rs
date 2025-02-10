@@ -4,18 +4,18 @@ use std::collections::BTreeMap;
 use rustc_hash::FxHashMap;
 use tracing::instrument;
 
-use distribution_filename::{DistFilename, SourceDistFilename, WheelFilename};
-use distribution_types::{
+use uv_client::FlatIndexEntries;
+use uv_configuration::BuildOptions;
+use uv_distribution_filename::{DistFilename, SourceDistFilename, WheelFilename};
+use uv_distribution_types::{
     File, HashComparison, HashPolicy, IncompatibleSource, IncompatibleWheel, IndexUrl,
     PrioritizedDist, RegistryBuiltWheel, RegistrySourceDist, SourceDistCompatibility,
     WheelCompatibility,
 };
-use pep440_rs::Version;
-use platform_tags::{TagCompatibility, Tags};
-use pypi_types::HashDigest;
-use uv_client::FlatIndexEntries;
-use uv_configuration::BuildOptions;
 use uv_normalize::PackageName;
+use uv_pep440::Version;
+use uv_platform_tags::{TagCompatibility, Tags};
+use uv_pypi_types::HashDigest;
 use uv_types::HashStrategy;
 
 /// A set of [`PrioritizedDist`] from a `--find-links` entry, indexed by [`PackageName`]
@@ -40,16 +40,16 @@ impl FlatIndex {
     ) -> Self {
         // Collect compatible distributions.
         let mut index = FxHashMap::default();
-        for (filename, file, url) in entries.entries {
-            let distributions = index.entry(filename.name().clone()).or_default();
+        for entry in entries.entries {
+            let distributions = index.entry(entry.filename.name().clone()).or_default();
             Self::add_file(
                 distributions,
-                file,
-                filename,
+                entry.file,
+                entry.filename,
                 tags,
                 hasher,
                 build_options,
-                url,
+                entry.index,
             );
         }
 
@@ -181,7 +181,7 @@ impl FlatIndex {
         };
 
         // Break ties with the build tag.
-        let build_tag = filename.build_tag.clone();
+        let build_tag = filename.build_tag().cloned();
 
         WheelCompatibility::Compatible(hash, priority, build_tag)
     }
@@ -224,5 +224,12 @@ impl IntoIterator for FlatDistributions {
 impl From<FlatDistributions> for BTreeMap<Version, PrioritizedDist> {
     fn from(distributions: FlatDistributions) -> Self {
         distributions.0
+    }
+}
+
+/// For external users.
+impl From<BTreeMap<Version, PrioritizedDist>> for FlatDistributions {
+    fn from(distributions: BTreeMap<Version, PrioritizedDist>) -> Self {
+        Self(distributions)
     }
 }

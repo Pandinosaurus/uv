@@ -1,10 +1,10 @@
 use either::Either;
-use pep508_rs::PackageName;
+use uv_pep508::PackageName;
 
-use pypi_types::Requirement;
 use rustc_hash::FxHashMap;
 use uv_cache::Refresh;
 use uv_cache_info::Timestamp;
+use uv_pypi_types::Requirement;
 
 /// Whether to reinstall packages.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
@@ -45,6 +45,39 @@ impl Reinstall {
     /// Returns `true` if all packages should be reinstalled.
     pub fn is_all(&self) -> bool {
         matches!(self, Self::All)
+    }
+
+    /// Returns `true` if the specified package should be reinstalled.
+    pub fn contains(&self, package_name: &PackageName) -> bool {
+        match &self {
+            Self::None => false,
+            Self::All => true,
+            Self::Packages(packages) => packages.contains(package_name),
+        }
+    }
+
+    /// Combine a set of [`Reinstall`] values.
+    #[must_use]
+    pub fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            // If both are `None`, the result is `None`.
+            (Self::None, Self::None) => Self::None,
+            // If either is `All`, the result is `All`.
+            (Self::All, _) | (_, Self::All) => Self::All,
+            // If one is `None`, the result is the other.
+            (Self::Packages(a), Self::None) => Self::Packages(a),
+            (Self::None, Self::Packages(b)) => Self::Packages(b),
+            // If both are `Packages`, the result is the union of the two.
+            (Self::Packages(mut a), Self::Packages(b)) => {
+                a.extend(b);
+                Self::Packages(a)
+            }
+        }
+    }
+
+    /// Create a [`Reinstall`] strategy to reinstall a single package.
+    pub fn package(package_name: PackageName) -> Self {
+        Self::Packages(vec![package_name])
     }
 }
 

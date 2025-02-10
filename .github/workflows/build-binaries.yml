@@ -4,7 +4,7 @@
 #
 # Assumed to run as a subworkflow of .github/workflows/release.yml; specifically, as a local
 # artifacts job within `cargo-dist`.
-name: "Build binaries"
+name: "Build release binaries"
 
 on:
   workflow_call:
@@ -14,8 +14,10 @@ on:
         type: string
   pull_request:
     paths:
-      # When we change pyproject.toml, we want to ensure that the maturin builds still work.
+      # When we change project metadata, we want to ensure that the maturin builds still work.
       - pyproject.toml
+      - Cargo.toml
+      - Cargo.lock
       # And when we change this workflow itself...
       - .github/workflows/build-binaries.yml
 
@@ -64,7 +66,7 @@ jobs:
 
   macos-x86_64:
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'no-build') }}
-    runs-on: macos-12-large
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
         with:
@@ -154,7 +156,7 @@ jobs:
 
   windows:
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'no-build') }}
-    runs-on: windows-latest
+    runs-on: github-windows-2022-x86_64-8
     strategy:
       matrix:
         platform:
@@ -162,6 +164,8 @@ jobs:
             arch: x64
           - target: i686-pc-windows-msvc
             arch: x86
+          - target: aarch64-pc-windows-msvc
+            arch: x64 # not relevant here
     steps:
       - uses: actions/checkout@v4
         with:
@@ -207,7 +211,7 @@ jobs:
 
   linux:
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'no-build') }}
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-latest-4
     strategy:
       matrix:
         target:
@@ -352,11 +356,10 @@ jobs:
             *.tar.gz
             *.sha256
 
-  # Like `linux-arm`, but use `--no-default-features --features flate2/rust_backend` when
-  # building uv.
+  # Like `linux-arm`.
   linux-s390x:
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'no-build') }}
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-latest-4
     strategy:
       matrix:
         platform:
@@ -378,7 +381,7 @@ jobs:
           target: ${{ matrix.platform.target }}
           manylinux: auto
           docker-options: ${{ matrix.platform.maturin_docker_options }}
-          args: --release --locked --out dist --no-default-features --features flate2/rust_backend --features self-update
+          args: --release --locked --out dist --features self-update
       - uses: uraimo/run-on-arch-action@v2
         if: matrix.platform.arch != 'ppc64'
         name: Test wheel
@@ -421,8 +424,7 @@ jobs:
             *.tar.gz
             *.sha256
 
-  # Like `linux-arm`, but use `--no-default-features --features flate2/rust_backend` when
-  # building uv, and install the `gcc-powerpc64-linux-gnu` package.
+  # Like `linux-arm`, but install the `gcc-powerpc64-linux-gnu` package.
   linux-powerpc:
     if: ${{ !contains(github.event.pull_request.labels.*.name, 'no-build') }}
     runs-on: ubuntu-latest
@@ -453,7 +455,7 @@ jobs:
           target: ${{ matrix.platform.target }}
           manylinux: auto
           docker-options: ${{ matrix.platform.maturin_docker_options }}
-          args: --release --locked --out dist --no-default-features --features flate2/rust_backend --features self-update
+          args: --release --locked --out dist --features self-update
           before-script-linux: |
             if command -v yum &> /dev/null; then
                 yum update -y
@@ -461,21 +463,22 @@ jobs:
                 yum repolist
                 yum install -y gcc-powerpc64-linux-gnu
             fi
-      - uses: uraimo/run-on-arch-action@v2
-        if: matrix.platform.arch != 'ppc64'
-        name: Test wheel
-        with:
-          arch: ${{ matrix.platform.arch }}
-          distro: ubuntu20.04
-          githubToken: ${{ github.token }}
-          install: |
-            apt-get update
-            apt-get install -y --no-install-recommends python3 python3-pip
-            pip3 install -U pip
-          run: |
-            pip3 install ${{ env.PACKAGE_NAME }} --no-index --find-links dist/ --force-reinstall
-            ${{ env.MODULE_NAME }} --help
-            uvx --help
+      # TODO(charlie): Re-enable testing for PPC wheels.
+      # - uses: uraimo/run-on-arch-action@v2
+      #   if: matrix.platform.arch != 'ppc64'
+      #   name: Test wheel
+      #   with:
+      #     arch: ${{ matrix.platform.arch }}
+      #     distro: ubuntu20.04
+      #     githubToken: ${{ github.token }}
+      #     install: |
+      #       apt-get update
+      #       apt-get install -y --no-install-recommends python3 python3-pip
+      #       pip3 install -U pip
+      #     run: |
+      #       pip3 install ${{ env.PACKAGE_NAME }} --no-index --find-links dist/ --force-reinstall
+      #       ${{ env.MODULE_NAME }} --help
+      #       uvx --help
       - name: "Upload wheels"
         uses: actions/upload-artifact@v4
         with:
@@ -578,11 +581,6 @@ jobs:
             maturin_docker_options: -e JEMALLOC_SYS_WITH_LG_PAGE=16
           - target: armv7-unknown-linux-musleabihf
             arch: armv7
-          - target: powerpc64le-unknown-linux-musl
-            arch: ppc64le
-            # see https://github.com/astral-sh/uv/issues/6528
-            maturin_docker_options: -e JEMALLOC_SYS_WITH_LG_PAGE=16
-            toolchain: nightly
       fail-fast: false
 
     steps:
@@ -599,9 +597,9 @@ jobs:
         with:
           target: ${{ matrix.platform.target }}
           manylinux: musllinux_1_1
-          args: ${{ matrix.platform.arch == 'ppc64le' && '--profile release-no-lto' || '--release'}} --locked --out dist --features self-update ${{ matrix.platform.arch == 'aarch64' && '--compatibility 2_17' || ''}}
+          args: --release --locked --out dist --features self-update ${{ matrix.platform.arch == 'aarch64' && '--compatibility 2_17' || ''}}
           docker-options: ${{ matrix.platform.maturin_docker_options }}
-          rust-toolchain: ${{ matrix.platform.toolchain || 'stable' }}
+          rust-toolchain: ${{ matrix.platform.toolchain || null }}
       - uses: uraimo/run-on-arch-action@v2
         name: Test wheel
         with:

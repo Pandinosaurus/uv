@@ -1,6 +1,6 @@
 use std::fmt::{Display, Formatter};
 
-use pep508_rs::PackageName;
+use uv_pep508::PackageName;
 
 use crate::{PackageNameSpecifier, PackageNameSpecifiers};
 
@@ -31,6 +31,8 @@ pub enum BuildOutput {
     Stderr,
     /// Send the build backend output to `tracing`.
     Debug,
+    /// Do not display the build backend output.
+    Quiet,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

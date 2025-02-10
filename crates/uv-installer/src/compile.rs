@@ -15,6 +15,7 @@ use tracing::{debug, instrument};
 use walkdir::WalkDir;
 
 use uv_fs::Simplified;
+use uv_static::EnvVars;
 use uv_warnings::warn_user;
 
 const COMPILEALL_SCRIPT: &str = include_str!("pip_compileall.py");
@@ -47,8 +48,11 @@ pub enum CompileError {
         #[source]
         err: Box<Self>,
     },
-    #[error("Bytecode timed out ({}s)", _0.as_secs_f32())]
-    CompileTimeout(Duration),
+    #[error("Bytecode timed out ({}s) compiling file: `{}`", elapsed.as_secs_f32(), source_file)]
+    CompileTimeout {
+        elapsed: Duration,
+        source_file: String,
+    },
     #[error("Python startup timed out ({}s)", _0.as_secs_f32())]
     StartupTimeout(Duration),
 }
@@ -71,7 +75,8 @@ pub async fn compile_tree(
 ) -> Result<usize, CompileError> {
     debug_assert!(
         dir.is_absolute(),
-        "compileall doesn't work with relative paths"
+        "compileall doesn't work with relative paths: `{}`",
+        dir.display()
     );
     let worker_count = std::thread::available_parallelism().unwrap_or_else(|err| {
         warn_user!("Couldn't determine number of cores, compiling with a single thread: {err}");
@@ -266,7 +271,7 @@ async fn launch_bytecode_compiler(
         .stderr(Stdio::piped())
         .current_dir(dir)
         // Otherwise stdout is buffered and we'll wait forever for a response
-        .env("PYTHONUNBUFFERED", "1")
+        .env(EnvVars::PYTHONUNBUFFERED, "1")
         .spawn()
         .map_err(CompileError::PythonSubcommand)?;
 
@@ -357,7 +362,10 @@ async fn worker_main_loop(
         // should ever take.
         tokio::time::timeout(COMPILE_TIMEOUT, python_handle)
             .await
-            .map_err(|_| CompileError::CompileTimeout(COMPILE_TIMEOUT))??;
+            .map_err(|_| CompileError::CompileTimeout {
+                elapsed: COMPILE_TIMEOUT,
+                source_file: source_file.clone(),
+            })??;
 
         // This is a sanity check, if we don't get the path back something has gone wrong, e.g.
         // we're not actually running a python interpreter.
