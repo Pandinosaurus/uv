@@ -1,3 +1,10 @@
+---
+title: Running scripts
+description:
+  A guide to using uv to run Python scripts, including support for inline dependency metadata,
+  reproducible scripts, and more.
+---
+
 # Running scripts
 
 A Python script is a file intended for standalone execution, e.g., with `python <script>.py`. Using
@@ -74,7 +81,7 @@ install the current project before running the script. If your script does not d
 project, use the `--no-project` flag to skip this:
 
 ```console
-$ # Note, it is important that the flag comes _before_ the script
+$ # Note: the `--no-project` flag must be provided _before_ the script name.
 $ uv run --no-project example.py
 ```
 
@@ -127,11 +134,20 @@ Multiple dependencies can be requested by repeating with `--with` option.
 Note that if `uv run` is used in a _project_, these dependencies will be included _in addition_ to
 the project's dependencies. To opt-out of this behavior, use the `--no-project` flag.
 
-## Declaring script dependencies
+## Creating a Python script
 
 Python recently added a standard format for
 [inline script metadata](https://packaging.python.org/en/latest/specifications/inline-script-metadata/#inline-script-metadata).
-This allows the dependencies for a script to be declared in the script itself.
+It allows for selecting Python versions and defining dependencies. Use `uv init --script` to
+initialize scripts with the inline metadata:
+
+```console
+$ uv init --script example.py --python 3.12
+```
+
+## Declaring script dependencies
+
+The inline metadata format allows the dependencies for a script to be declared in the script itself.
 
 uv supports adding and updating inline script metadata for you. Use `uv add --script` to declare the
 dependencies for the script:
@@ -178,7 +194,7 @@ $ uv run example.py
 
 !!! important
 
-    When using inline script metadata, even if `uv run` is [used in a _project_](../concepts/projects.md#running-scripts), the project's dependencies will be ignored. The `--no-project` flag is not required.
+    When using inline script metadata, even if `uv run` is [used in a _project_](../concepts/projects/run.md), the project's dependencies will be ignored. The `--no-project` flag is not required.
 
 uv also respects Python version requirements:
 
@@ -201,11 +217,49 @@ print(Point)
 is not installed — see the documentation on [Python versions](../concepts/python-versions.md) for
 more details.
 
+## Using alternative package indexes
+
+If you wish to use an alternative [package index](../configuration/indexes.md) to resolve
+dependencies, you can provide the index with the `--index` option:
+
+```console
+$ uv add --index "https://example.com/simple" --script example.py 'requests<3' 'rich'
+```
+
+This will include the package data in the inline metadata:
+
+```python
+# [[tool.uv.index]]
+# url = "https://example.com/simple"
+```
+
+If you require authentication to access the package index, then please refer to the
+[package index](../configuration/indexes.md) documentation.
+
+## Locking dependencies
+
+uv supports locking dependencies for PEP 723 scripts using the `uv.lock` file format. Unlike with
+projects, scripts must be explicitly locked using `uv lock`:
+
+```console
+$ uv lock --script example.py
+```
+
+Running `uv lock --script` will create a `.lock` file adjacent to the script (e.g.,
+`example.py.lock`).
+
+Once locked, subsequent operations like `uv run --script`, `uv add --script`, `uv export --script`,
+and `uv tree --script` will reuse the locked dependencies, updating the lockfile if necessary.
+
+If no such lockfile is present, commands like `uv export --script` will still function as expected,
+but will not create a lockfile.
+
 ## Improving reproducibility
 
-uv supports an `exclude-newer` field in the `tool.uv` section of inline script metadata to limit uv
-to only considering distributions released before a specific date. This is useful for improving the
-reproducibility of your script when run at a later point in time.
+In addition to locking dependencies, uv supports an `exclude-newer` field in the `tool.uv` section
+of inline script metadata to limit uv to only considering distributions released before a specific
+date. This is useful for improving the reproducibility of your script when run at a later point in
+time.
 
 The date must be specified as an [RFC 3339](https://www.rfc-editor.org/rfc/rfc3339.html) timestamp
 (e.g., `2006-12-02T02:07:43Z`).
@@ -237,13 +291,13 @@ print(".".join(map(str, sys.version_info[:3])))
 ```console
 $ # Use the default Python version, may differ on your machine
 $ uv run example.py
-3.12.1
+3.12.6
 ```
 
 ```console
 $ # Use a specific Python version
 $ uv run --python 3.10 example.py
-3.10.13
+3.10.15
 ```
 
 See the [Python version request](../concepts/python-versions.md#requesting-a-version) documentation

@@ -50,7 +50,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Generator, Iterable, NamedTuple, Self
@@ -72,10 +72,39 @@ def batched(iterable: Iterable, n: int) -> Generator[tuple, None, None]:
         yield batch
 
 
+@dataclass(frozen=True)
+class Arch:
+    # The architecture family, e.g. "x86_64", "aarch64".
+    family: str
+    # The architecture variant, e.g., "v2" in "x86_64_v2"
+    variant: str | None = None
+
+    def key(self) -> str:
+        return str(self)
+
+    def __str__(self) -> str:
+        return (self.family + "_" + self.variant) if self.variant else self.family
+
+    def __gt__(self, other) -> bool:
+        return (self.family, self.variant or "") > (other.family, other.variant or "")
+
+    def __lt__(self, other) -> bool:
+        return (self.family, self.variant or "") < (other.family, other.variant or "")
+
+
+type PlatformTripleKey = tuple[str, str, str]
+
+
 class PlatformTriple(NamedTuple):
-    arch: str
+    # The operating system, e.g. "linux", "macos", "windows".
     platform: str
+    # The architecture, e.g. "x86_64", "aarch64".
+    arch: Arch
+    # The libc implementation, e.g. "gnu", "musl", "none".
     libc: str
+
+    def key(self) -> PlatformTripleKey:
+        return (self.platform, self.arch.key(), self.libc)
 
 
 class Version(NamedTuple):
@@ -106,6 +135,11 @@ class ImplementationName(StrEnum):
     PYPY = "pypy"
 
 
+class Variant(StrEnum):
+    FREETHREADED = "freethreaded"
+    DEBUG = "debug"
+
+
 @dataclass
 class PythonDownload:
     version: Version
@@ -115,9 +149,14 @@ class PythonDownload:
     filename: str
     url: str
     sha256: str | None = None
+    build_options: list[str] = field(default_factory=list)
+    variant: Variant | None = None
 
     def key(self) -> str:
-        return f"{self.implementation}-{self.version}-{self.triple.platform}-{self.triple.arch}-{self.triple.libc}"
+        if self.variant:
+            return f"{self.implementation}-{self.version}+{self.variant}-{self.triple.platform}-{self.triple.arch}-{self.triple.libc}"
+        else:
+            return f"{self.implementation}-{self.version}-{self.triple.platform}-{self.triple.arch}-{self.triple.libc}"
 
 
 class Finder:
@@ -132,7 +171,7 @@ class CPythonFinder(Finder):
     implementation = ImplementationName.CPYTHON
 
     RELEASE_URL = (
-        "https://api.github.com/repos/indygreg/python-build-standalone/releases"
+        "https://api.github.com/repos/astral-sh/python-build-standalone/releases"
     )
 
     FLAVOR_PREFERENCES = [
@@ -141,13 +180,6 @@ class CPythonFinder(Finder):
         "shared-pgo",
         "shared-noopt",
         "static-noopt",
-        "pgo+lto",
-        "pgo",
-        "lto",
-        "debug",
-    ]
-    HIDDEN_FLAVORS = [
-        "noopt",
     ]
     SPECIAL_TRIPLES = {
         "macos": "x86_64-apple-darwin",
@@ -167,24 +199,28 @@ class CPythonFinder(Finder):
     _filename_re = re.compile(
         r"""(?x)
         ^
-            cpython-(?P<ver>\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?)
-            (?:\+\d+)?
-            -(?P<triple>.*?)
-            (?:-[\dT]+)?\.tar\.(?:gz|zst)
+            cpython-
+            (?P<ver>\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?)(?:\+\d+)?\+
+            (?P<date>\d+)-
+            (?P<triple>[a-z\d_]+-[a-z\d]+(?>-[a-z\d]+)?-[a-z\d]+)-
+            (?:(?P<build_options>.+)-)?
+            (?P<flavor>[a-z_]+)?
+            \.tar\.(?:gz|zst)
         $
-    """
+        """
     )
 
-    _flavor_re = re.compile(
-        r"""(?x)^(.*?)-(%s)$"""
-        % (
-            "|".join(
-                map(
-                    re.escape,
-                    sorted(FLAVOR_PREFERENCES + HIDDEN_FLAVORS, key=len, reverse=True),
-                )
-            )
-        )
+    _legacy_filename_re = re.compile(
+        r"""(?x)
+        ^
+            cpython-
+            (?P<ver>\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?)(?:\+\d+)?-
+            (?P<triple>[a-z\d_-]+)-
+            (?P<build_options>(debug|pgo|noopt|lto|pgo\+lto))?-
+            (?P<date>[a-zA-z\d]+)
+            \.tar\.(?:gz|zst)
+        $
+        """
     )
 
     def __init__(self, client: httpx.AsyncClient):
@@ -197,40 +233,60 @@ class CPythonFinder(Finder):
 
     async def _fetch_downloads(self, pages: int = 100) -> list[PythonDownload]:
         """Fetch all the indygreg downloads from the release API."""
-        results: dict[Version, list[PythonDownload]] = {}
+        downloads_by_version: dict[Version, list[PythonDownload]] = {}
 
         # Collect all available Python downloads
         for page in range(1, pages + 1):
             logging.info("Fetching CPython release page %d", page)
-            resp = await self.client.get(self.RELEASE_URL, params={"page": page})
+            resp = await self.client.get(
+                self.RELEASE_URL, params={"page": page, "per_page": 10}
+            )
             resp.raise_for_status()
             rows = resp.json()
             if not rows:
                 break
             for row in rows:
+                # Sort the assets to ensure deterministic results
+                row["assets"].sort(key=lambda asset: asset["browser_download_url"])
                 for asset in row["assets"]:
                     url = asset["browser_download_url"]
                     download = self._parse_download_url(url)
                     if download is None:
                         continue
-                    results.setdefault(download.version, []).append(download)
+                    logging.debug("Found %s (%s)", download.key(), download.filename)
+                    downloads_by_version.setdefault(download.version, []).append(
+                        download
+                    )
 
-        # Collapse CPython variants to a single URL flavor per triple
+        # Collapse CPython variants to a single flavor per triple and variant
         downloads = []
-        for choices in results.values():
-            flavors: dict[PlatformTriple, tuple[PythonDownload, int]] = {}
-            for choice in choices:
-                priority = self._get_flavor_priority(choice.flavor)
-                existing = flavors.get(choice.triple)
+        for version_downloads in downloads_by_version.values():
+            selected: dict[
+                tuple[PlatformTripleKey, Variant | None],
+                tuple[PythonDownload, tuple[int, int]],
+            ] = {}
+            for download in version_downloads:
+                priority = self._get_priority(download)
+                existing = selected.get((download.triple.key(), download.variant))
                 if existing:
-                    _, existing_priority = existing
+                    existing_download, existing_priority = existing
                     # Skip if we have a flavor with higher priority already (indicated by a smaller value)
                     if priority >= existing_priority:
+                        logging.debug(
+                            "Skipping %s (%s): lower priority than %s (%s)",
+                            download.key(),
+                            download.flavor,
+                            existing_download.key(),
+                            existing_download.flavor,
+                        )
                         continue
-                flavors[choice.triple] = (choice, priority)
+                selected[(download.triple.key(), download.variant)] = (
+                    download,
+                    priority,
+                )
 
             # Drop the priorities
-            downloads.extend([choice for choice, _ in flavors.values()])
+            downloads.extend([download for download, _ in selected.values()])
 
         return downloads
 
@@ -281,30 +337,36 @@ class CPythonFinder(Finder):
     def _parse_download_url(self, url: str) -> PythonDownload | None:
         """Parse an indygreg download URL into a PythonDownload object."""
         # Ex)
-        # https://github.com/indygreg/python-build-standalone/releases/download/20240107/cpython-3.12.1%2B20240107-aarch64-unknown-linux-gnu-lto-full.tar.zst
+        # https://github.com/astral-sh/python-build-standalone/releases/download/20240107/cpython-3.12.1%2B20240107-aarch64-unknown-linux-gnu-lto-full.tar.zst
         if url.endswith(".sha256"):
             return None
         filename = unquote(url.rsplit("/", maxsplit=1)[-1])
 
-        match = self._filename_re.match(filename)
+        match = self._filename_re.match(filename) or self._legacy_filename_re.match(
+            filename
+        )
         if match is None:
+            logging.debug("Skipping %s: no regex match", filename)
             return None
 
-        version, triple = match.groups()
-        if triple.endswith("-full"):
-            triple = triple[:-5]
+        groups = match.groupdict()
+        version = groups["ver"]
+        triple = groups["triple"]
+        build_options = groups.get("build_options")
+        flavor = groups.get("flavor", "full")
 
-        match = self._flavor_re.match(triple)
-        if match is not None:
-            triple, flavor = match.groups()
+        build_options = build_options.split("+") if build_options else []
+        variant: Variant | None
+        for variant in Variant:
+            if variant in build_options:
+                break
         else:
-            flavor = ""
-        if flavor in self.HIDDEN_FLAVORS:
-            return None
+            variant = None
 
         version = Version.from_str(version)
         triple = self._normalize_triple(triple)
         if triple is None:
+            # Skip is logged in `_normalize_triple`
             return None
 
         return PythonDownload(
@@ -314,6 +376,8 @@ class CPythonFinder(Finder):
             implementation=self.implementation,
             filename=filename,
             url=url,
+            build_options=build_options,
+            variant=variant,
         )
 
     def _normalize_triple(self, triple: str) -> PlatformTriple | None:
@@ -335,24 +399,41 @@ class CPythonFinder(Finder):
             logging.debug("Skipping %r: unknown triple", triple)
             return None
 
-        return PlatformTriple(arch, operating_system, libc)
+        return PlatformTriple(operating_system, arch, libc)
 
-    def _normalize_arch(self, arch: str) -> str:
+    def _normalize_arch(self, arch: str) -> Arch:
         arch = self.ARCH_MAP.get(arch, arch)
         pieces = arch.split("_")
-        # Strip `_vN` from `x86_64`
-        return "_".join(pieces[:2])
+        family = "_".join(pieces[:2])
+        variant = pieces[2] if len(pieces) > 2 else None
+        return Arch(family, variant)
 
     def _normalize_os(self, os: str) -> str:
         return os
 
-    def _get_flavor_priority(self, flavor: str) -> int:
-        """Returns the priority of a flavor. Lower is better."""
+    def _get_priority(self, download: PythonDownload) -> tuple[int, int]:
+        """
+        Returns the priority of a download, a lower score is better.
+        """
+        flavor_priority = self._flavor_priority(download.flavor)
+        build_option_priority = self._build_option_priority(download.build_options)
+        return (flavor_priority, build_option_priority)
+
+    def _flavor_priority(self, flavor: str) -> int:
         try:
-            pref = self.FLAVOR_PREFERENCES.index(flavor)
+            priority = self.FLAVOR_PREFERENCES.index(flavor)
         except ValueError:
-            pref = len(self.FLAVOR_PREFERENCES) + 1
-        return pref
+            priority = len(self.FLAVOR_PREFERENCES) + 1
+        return priority
+
+    def _build_option_priority(self, build_options: list[str]) -> int:
+        # Prefer optimized builds
+        return -1 * sum(
+            (
+                "lto" in build_options,
+                "pgo" in build_options,
+            )
+        )
 
 
 class PyPyFinder(Finder):
@@ -410,8 +491,8 @@ class PyPyFinder(Finder):
                 download = PythonDownload(
                     version=python_version,
                     triple=PlatformTriple(
-                        arch=arch,
                         platform=platform,
+                        arch=arch,
                         libc=libc,
                     ),
                     flavor="",
@@ -425,8 +506,8 @@ class PyPyFinder(Finder):
 
         return list(results.values())
 
-    def _normalize_arch(self, arch: str) -> str:
-        return self.ARCH_MAPPING.get(arch, arch)
+    def _normalize_arch(self, arch: str) -> Arch:
+        return Arch(self.ARCH_MAPPING.get(arch, arch), None)
 
     def _normalize_os(self, os: str) -> str:
         return self.PLATFORM_MAPPING.get(os, os)
@@ -448,14 +529,37 @@ class PyPyFinder(Finder):
 def render(downloads: list[PythonDownload]) -> None:
     """Render `download-metadata.json`."""
 
+    def prerelease_sort_key(prerelease: str) -> tuple[int, int]:
+        if prerelease.startswith("a"):
+            return 0, int(prerelease[1:])
+        if prerelease.startswith("b"):
+            return 1, int(prerelease[1:])
+        if prerelease.startswith("rc"):
+            return 2, int(prerelease[2:])
+        return 3, 0
+
+    def variant_sort_key(variant: Variant | None) -> int:
+        if variant is None:
+            return 0
+        match variant:
+            case Variant.FREETHREADED:
+                return 1
+            case Variant.DEBUG:
+                return 2
+        raise ValueError(f"Missing sort key implementation for variant: {variant}")
+
     def sort_key(download: PythonDownload) -> tuple:
         # Sort by implementation, version (latest first), and then by triple.
         impl_order = [ImplementationName.CPYTHON, ImplementationName.PYPY]
+        prerelease = prerelease_sort_key(download.version.prerelease)
         return (
             impl_order.index(download.implementation),
             -download.version.major,
             -download.version.minor,
             -download.version.patch,
+            -prerelease[0],
+            -prerelease[1],
+            variant_sort_key(download.variant),
             download.triple,
         )
 
@@ -465,11 +569,11 @@ def render(downloads: list[PythonDownload]) -> None:
     for download in downloads:
         key = download.key()
         logging.info(
-            "Found %s%s", key, (" (%s)" % download.flavor) if download.flavor else ""
+            "Selected %s%s", key, (" (%s)" % download.flavor) if download.flavor else ""
         )
         results[key] = {
             "name": download.implementation,
-            "arch": download.triple.arch,
+            "arch": asdict(download.triple.arch),
             "os": download.triple.platform,
             "libc": download.triple.libc,
             "major": download.version.major,
@@ -478,6 +582,7 @@ def render(downloads: list[PythonDownload]) -> None:
             "prerelease": download.version.prerelease,
             "url": download.url,
             "sha256": download.sha256,
+            "variant": download.variant if download.variant else None,
         }
 
     VERSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -492,7 +597,10 @@ async def find() -> None:
             "`GITHUB_TOKEN` env var not found, you may hit rate limits for GitHub API requests."
         )
 
-    headers = {"X-GitHub-Api-Version": "2022-11-28"}
+    headers = {
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Accept-Encoding": "gzip, deflate",
+    }
     if token:
         headers["Authorization"] = "Bearer " + token
     client = httpx.AsyncClient(follow_redirects=True, headers=headers, timeout=15)
@@ -541,6 +649,7 @@ def main() -> None:
     )
     # Silence httpx logging
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     asyncio.run(find())
 

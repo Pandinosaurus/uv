@@ -1,10 +1,14 @@
-use owo_colors::OwoColorize;
 use std::borrow::Cow;
 use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use owo_colors::OwoColorize;
+use tracing::debug;
+
 use uv_cache::Cache;
+use uv_cache_key::cache_digest;
 use uv_fs::{LockedFile, Simplified};
 
 use crate::discovery::find_python_installation;
@@ -32,6 +36,18 @@ struct PythonEnvironmentShared {
 pub struct EnvironmentNotFound {
     request: PythonRequest,
     preference: EnvironmentPreference,
+}
+
+#[derive(Clone, Debug, Error)]
+pub struct InvalidEnvironment {
+    path: PathBuf,
+    pub kind: InvalidEnvironmentKind,
+}
+#[derive(Debug, Clone)]
+pub enum InvalidEnvironmentKind {
+    NotDirectory,
+    Empty,
+    MissingExecutable(PathBuf),
 }
 
 impl From<PythonNotFound> for EnvironmentNotFound {
@@ -80,7 +96,7 @@ impl fmt::Display for EnvironmentNotFound {
             EnvironmentPreference::OnlyVirtual => SearchType::Virtual,
         };
 
-        if matches!(self.request, PythonRequest::Any) {
+        if matches!(self.request, PythonRequest::Default | PythonRequest::Any) {
             write!(f, "No {search_type} found")?;
         } else {
             write!(f, "No {search_type} found for {}", self.request)?;
@@ -95,6 +111,29 @@ impl fmt::Display for EnvironmentNotFound {
         }
 
         Ok(())
+    }
+}
+
+impl fmt::Display for InvalidEnvironment {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "Invalid environment at `{}`: {}",
+            self.path.user_display(),
+            self.kind
+        )
+    }
+}
+
+impl fmt::Display for InvalidEnvironmentKind {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::NotDirectory => write!(f, "expected directory but found a file"),
+            Self::MissingExecutable(path) => {
+                write!(f, "missing Python executable at `{}`", path.user_display())
+            }
+            Self::Empty => write!(f, "directory is empty"),
+        }
     }
 }
 
@@ -122,10 +161,16 @@ impl PythonEnvironment {
     }
 
     /// Create a [`PythonEnvironment`] from the virtual environment at the given root.
+    ///
+    /// N.B. This function also works for system Python environments and users depend on this.
     pub fn from_root(root: impl AsRef<Path>, cache: &Cache) -> Result<Self, Error> {
-        let venv = match fs_err::canonicalize(root.as_ref()) {
-            Ok(venv) => venv,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        debug!(
+            "Checking for Python environment at `{}`",
+            root.as_ref().user_display()
+        );
+        match root.as_ref().try_exists() {
+            Ok(true) => {}
+            Ok(false) => {
                 return Err(Error::MissingEnvironment(EnvironmentNotFound {
                     preference: EnvironmentPreference::Any,
                     request: PythonRequest::Directory(root.as_ref().to_owned()),
@@ -133,7 +178,41 @@ impl PythonEnvironment {
             }
             Err(err) => return Err(Error::Discovery(err.into())),
         };
-        let executable = virtualenv_python_executable(venv);
+
+        if root.as_ref().is_file() {
+            return Err(InvalidEnvironment {
+                path: root.as_ref().to_path_buf(),
+                kind: InvalidEnvironmentKind::NotDirectory,
+            }
+            .into());
+        }
+
+        if root
+            .as_ref()
+            .read_dir()
+            .is_ok_and(|mut dir| dir.next().is_none())
+        {
+            return Err(InvalidEnvironment {
+                path: root.as_ref().to_path_buf(),
+                kind: InvalidEnvironmentKind::Empty,
+            }
+            .into());
+        }
+
+        // Note we do not canonicalize the root path or the executable path, this is important
+        // because the path the interpreter is invoked at can determine the value of
+        // `sys.executable`.
+        let executable = virtualenv_python_executable(&root);
+
+        // If we can't find an executable, exit before querying to provide a better error.
+        if !(executable.is_symlink() || executable.is_file()) {
+            return Err(InvalidEnvironment {
+                path: root.as_ref().to_path_buf(),
+                kind: InvalidEnvironmentKind::MissingExecutable(executable.clone()),
+            }
+            .into());
+        };
+
         let interpreter = Interpreter::query(executable, cache)?;
 
         Ok(Self(Arc::new(PythonEnvironmentShared {
@@ -231,7 +310,7 @@ impl PythonEnvironment {
         } else {
             // Otherwise, use a global lockfile.
             LockedFile::acquire(
-                env::temp_dir().join(format!("uv-{}.lock", cache_key::cache_digest(&self.0.root))),
+                env::temp_dir().join(format!("uv-{}.lock", cache_digest(&self.0.root))),
                 self.0.root.user_display(),
             )
             .await
@@ -243,5 +322,27 @@ impl PythonEnvironment {
     /// See also [`PythonEnvironment::interpreter`].
     pub fn into_interpreter(self) -> Interpreter {
         Arc::unwrap_or_clone(self.0).interpreter
+    }
+
+    /// Returns `true` if the [`PythonEnvironment`] uses the same underlying [`Interpreter`].
+    pub fn uses(&self, interpreter: &Interpreter) -> bool {
+        // TODO(zanieb): Consider using `sysconfig.get_path("stdlib")` instead, which
+        // should be generally robust.
+        if cfg!(windows) {
+            // On Windows, we can't canonicalize an interpreter based on its executable path
+            // because the executables are separate shim files (not links). Instead, we
+            // compare the `sys.base_prefix`.
+            let old_base_prefix = self.interpreter().sys_base_prefix();
+            let selected_base_prefix = interpreter.sys_base_prefix();
+            old_base_prefix == selected_base_prefix
+        } else {
+            // On Unix, we can see if the canonicalized executable is the same file.
+            self.interpreter().sys_executable() == interpreter.sys_executable()
+                || same_file::is_same_file(
+                    self.interpreter().sys_executable(),
+                    interpreter.sys_executable(),
+                )
+                .unwrap_or(false)
+        }
     }
 }

@@ -1,38 +1,42 @@
+use std::collections::BTreeSet;
 use std::fmt::Write;
+use std::sync::Arc;
 
-use anstream::eprint;
 use anyhow::Result;
 use owo_colors::OwoColorize;
 use tracing::debug;
 
-use distribution_types::{DependencyMetadata, IndexLocations, Resolution};
-use install_wheel_rs::linker::LinkMode;
-use pep508_rs::PackageName;
-use uv_auth::store_credentials_from_url;
 use uv_cache::Cache;
 use uv_client::{BaseClientBuilder, Connectivity, FlatIndexClient, RegistryClientBuilder};
 use uv_configuration::{
-    BuildOptions, Concurrency, ConfigSettings, Constraints, ExtrasSpecification, HashCheckingMode,
-    IndexStrategy, Reinstall, SourceStrategy, TrustedHost, Upgrade,
+    BuildOptions, Concurrency, ConfigSettings, Constraints, DevGroupsSpecification, DryRun,
+    ExtrasSpecification, HashCheckingMode, IndexStrategy, PreviewMode, Reinstall, SourceStrategy,
+    TrustedHost, Upgrade,
 };
 use uv_configuration::{KeyringProviderType, TargetTriple};
-use uv_dispatch::BuildDispatch;
+use uv_dispatch::{BuildDispatch, SharedState};
+use uv_distribution_types::{DependencyMetadata, Index, IndexLocations, Origin, Resolution};
 use uv_fs::Simplified;
+use uv_install_wheel::LinkMode;
 use uv_installer::SitePackages;
+use uv_pep508::PackageName;
+use uv_pypi_types::Conflicts;
 use uv_python::{
-    EnvironmentPreference, Prefix, PythonEnvironment, PythonRequest, PythonVersion, Target,
+    EnvironmentPreference, Prefix, PythonEnvironment, PythonInstallation, PythonPreference,
+    PythonRequest, PythonVersion, Target,
 };
 use uv_requirements::{RequirementsSource, RequirementsSpecification};
 use uv_resolver::{
     DependencyMode, ExcludeNewer, FlatIndex, OptionsBuilder, PrereleaseMode, PythonRequirement,
-    ResolutionMode, ResolverMarkers,
+    ResolutionMode, ResolverEnvironment,
 };
 use uv_types::{BuildIsolation, HashStrategy};
 
 use crate::commands::pip::loggers::{DefaultInstallLogger, DefaultResolveLogger};
 use crate::commands::pip::operations::Modifications;
+use crate::commands::pip::operations::{report_interpreter, report_target_environment};
 use crate::commands::pip::{operations, resolution_markers, resolution_tags};
-use crate::commands::{ExitStatus, SharedState};
+use crate::commands::{diagnostics, ExitStatus};
 use crate::printer::Printer;
 
 /// Install a set of locked requirements into the current Python environment.
@@ -49,8 +53,8 @@ pub(crate) async fn pip_sync(
     index_strategy: IndexStrategy,
     dependency_metadata: DependencyMetadata,
     keyring_provider: KeyringProviderType,
-    allow_insecure_host: Vec<TrustedHost>,
     allow_empty_requirements: bool,
+    installer_metadata: bool,
     connectivity: Connectivity,
     config_settings: &ConfigSettings,
     no_build_isolation: bool,
@@ -66,21 +70,25 @@ pub(crate) async fn pip_sync(
     target: Option<Target>,
     prefix: Option<Prefix>,
     sources: SourceStrategy,
+    python_preference: PythonPreference,
     concurrency: Concurrency,
     native_tls: bool,
+    allow_insecure_host: &[TrustedHost],
     cache: Cache,
-    dry_run: bool,
+    dry_run: DryRun,
     printer: Printer,
+    preview: PreviewMode,
 ) -> Result<ExitStatus> {
     let client_builder = BaseClientBuilder::new()
         .connectivity(connectivity)
         .native_tls(native_tls)
         .keyring(keyring_provider)
-        .allow_insecure_host(allow_insecure_host);
+        .allow_insecure_host(allow_insecure_host.to_vec());
 
     // Initialize a few defaults.
     let overrides = &[];
     let extras = ExtrasSpecification::default();
+    let groups = DevGroupsSpecification::default();
     let upgrade = Upgrade::default();
     let resolution_mode = ResolutionMode::default();
     let prerelease_mode = PrereleaseMode::default();
@@ -105,6 +113,7 @@ pub(crate) async fn pip_sync(
         constraints,
         overrides,
         &extras,
+        &groups,
         &client_builder,
     )
     .await?;
@@ -123,20 +132,30 @@ pub(crate) async fn pip_sync(
     }
 
     // Detect the current Python interpreter.
-    let environment = PythonEnvironment::find(
-        &python
-            .as_deref()
-            .map(PythonRequest::parse)
-            .unwrap_or_default(),
-        EnvironmentPreference::from_system_flag(system, true),
-        &cache,
-    )?;
-
-    debug!(
-        "Using Python {} environment at {}",
-        environment.interpreter().python_version(),
-        environment.python_executable().user_display().cyan()
-    );
+    let environment = if target.is_some() || prefix.is_some() {
+        let installation = PythonInstallation::find(
+            &python
+                .as_deref()
+                .map(PythonRequest::parse)
+                .unwrap_or_default(),
+            EnvironmentPreference::from_system_flag(system, false),
+            python_preference,
+            &cache,
+        )?;
+        report_interpreter(&installation, true, printer)?;
+        PythonEnvironment::from_installation(installation)
+    } else {
+        let environment = PythonEnvironment::find(
+            &python
+                .as_deref()
+                .map(PythonRequest::parse)
+                .unwrap_or_default(),
+            EnvironmentPreference::from_system_flag(system, true),
+            &cache,
+        )?;
+        report_target_environment(&environment, &cache, printer)?;
+        environment
+    };
 
     // Apply any `--target` or `--prefix` directories.
     let environment = if let Some(target) = target {
@@ -187,7 +206,7 @@ pub(crate) async fn pip_sync(
     };
 
     // Determine the markers and tags to use for resolution.
-    let markers = resolution_markers(
+    let marker_env = resolution_markers(
         python_version.as_ref(),
         python_platform.as_ref(),
         interpreter,
@@ -207,7 +226,7 @@ pub(crate) async fn pip_sync(
             constraints
                 .iter()
                 .map(|entry| (&entry.requirement, entry.hashes.as_slice())),
-            Some(&markers),
+            Some(&marker_env),
             hash_checking,
         )?
     } else {
@@ -215,12 +234,30 @@ pub(crate) async fn pip_sync(
     };
 
     // Incorporate any index locations from the provided sources.
-    let index_locations =
-        index_locations.combine(index_url, extra_index_urls, find_links, no_index);
+    let index_locations = index_locations.combine(
+        extra_index_urls
+            .into_iter()
+            .map(Index::from_extra_index_url)
+            .chain(index_url.map(Index::from_index_url))
+            .map(|index| index.with_origin(Origin::RequirementsTxt))
+            .collect(),
+        find_links
+            .into_iter()
+            .map(Index::from_find_links)
+            .map(|index| index.with_origin(Origin::RequirementsTxt))
+            .collect(),
+        no_index,
+    );
 
     // Add all authenticated sources to the cache.
-    for url in index_locations.urls() {
-        store_credentials_from_url(url);
+    for index in index_locations.allowed_indexes() {
+        if let Some(credentials) = index.credentials() {
+            let credentials = Arc::new(credentials);
+            uv_auth::store_credentials(index.raw_url(), credentials.clone());
+            if let Some(root_url) = index.root_url() {
+                uv_auth::store_credentials(&root_url, credentials.clone());
+            }
+        }
     }
 
     // Initialize the registry client.
@@ -238,7 +275,9 @@ pub(crate) async fn pip_sync(
     // Resolve the flat indexes from `--find-links`.
     let flat_index = {
         let client = FlatIndexClient::new(&client, &cache);
-        let entries = client.fetch(index_locations.flat_index()).await?;
+        let entries = client
+            .fetch(index_locations.flat_indexes().map(Index::url))
+            .await?;
         FlatIndex::from_entries(entries, Some(&tags), &hasher, &build_options)
     };
 
@@ -259,7 +298,7 @@ pub(crate) async fn pip_sync(
             build_constraints
                 .iter()
                 .map(|entry| (&entry.requirement, entry.hashes.as_slice())),
-            Some(&markers),
+            Some(&marker_env),
             HashCheckingMode::Verify,
         )?
     } else {
@@ -277,9 +316,6 @@ pub(crate) async fn pip_sync(
     // When resolving, don't take any external preferences into account.
     let preferences = Vec::default();
 
-    // Ignore development dependencies.
-    let dev = Vec::default();
-
     // Create a build dispatch.
     let build_dispatch = BuildDispatch::new(
         &client,
@@ -289,10 +325,7 @@ pub(crate) async fn pip_sync(
         &index_locations,
         &flat_index,
         &dependency_metadata,
-        &state.index,
-        &state.git,
-        &state.capabilities,
-        &state.in_flight,
+        state.clone(),
         index_strategy,
         config_settings,
         build_isolation,
@@ -302,6 +335,7 @@ pub(crate) async fn pip_sync(
         exclude_newer,
         sources,
         concurrency,
+        preview,
     );
 
     // Determine the set of installed packages.
@@ -313,28 +347,30 @@ pub(crate) async fn pip_sync(
         .dependency_mode(dependency_mode)
         .exclude_newer(exclude_newer)
         .index_strategy(index_strategy)
+        .build_options(build_options.clone())
         .build();
 
     let resolution = match operations::resolve(
         requirements,
         constraints,
         overrides,
-        dev,
         source_trees,
         project,
-        None,
+        BTreeSet::default(),
         &extras,
+        &groups,
         preferences,
         site_packages.clone(),
         &hasher,
         &reinstall,
         &upgrade,
         Some(&tags),
-        ResolverMarkers::specific_environment(markers.clone()),
+        ResolverEnvironment::specific(marker_env.clone()),
         python_requirement,
+        Conflicts::empty(),
         &client,
         &flat_index,
-        &state.index,
+        state.index(),
         &build_dispatch,
         concurrency,
         options,
@@ -344,16 +380,15 @@ pub(crate) async fn pip_sync(
     .await
     {
         Ok(resolution) => Resolution::from(resolution),
-        Err(operations::Error::Resolve(uv_resolver::ResolveError::NoSolution(err))) => {
-            let report = miette::Report::msg(format!("{err}")).context(err.header());
-            eprint!("{report:?}");
-            return Ok(ExitStatus::Failure);
+        Err(err) => {
+            return diagnostics::OperationDiagnostic::native_tls(native_tls)
+                .report(err)
+                .map_or(Ok(ExitStatus::Failure), |err| Err(err.into()))
         }
-        Err(err) => return Err(err.into()),
     };
 
     // Sync the environment.
-    operations::install(
+    match operations::install(
         &resolution,
         site_packages,
         Modifications::Exact,
@@ -364,26 +399,34 @@ pub(crate) async fn pip_sync(
         &index_locations,
         config_settings,
         &hasher,
-        &markers,
         &tags,
         &client,
-        &state.in_flight,
+        state.in_flight(),
         concurrency,
         &build_dispatch,
         &cache,
         &environment,
         Box::new(DefaultInstallLogger),
+        installer_metadata,
         dry_run,
         printer,
     )
-    .await?;
+    .await
+    {
+        Ok(_) => {}
+        Err(err) => {
+            return diagnostics::OperationDiagnostic::native_tls(native_tls)
+                .report(err)
+                .map_or(Ok(ExitStatus::Failure), |err| Err(err.into()))
+        }
+    }
 
     // Notify the user of any resolution diagnostics.
     operations::diagnose_resolution(resolution.diagnostics(), printer)?;
 
     // Notify the user of any environment diagnostics.
-    if strict && !dry_run {
-        operations::diagnose_environment(&resolution, &environment, &markers, printer)?;
+    if strict && !dry_run.enabled() {
+        operations::diagnose_environment(&resolution, &environment, &marker_env, printer)?;
     }
 
     Ok(ExitStatus::Success)

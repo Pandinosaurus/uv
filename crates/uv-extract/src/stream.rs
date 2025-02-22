@@ -1,12 +1,14 @@
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 
-use crate::Error;
-use distribution_filename::SourceDistExtension;
 use futures::StreamExt;
 use rustc_hash::FxHashSet;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tracing::warn;
+
+use uv_distribution_filename::SourceDistExtension;
+
+use crate::Error;
 
 const DEFAULT_BUF_SIZE: usize = 128 * 1024;
 
@@ -19,6 +21,26 @@ pub async fn unzip<R: tokio::io::AsyncRead + Unpin>(
     reader: R,
     target: impl AsRef<Path>,
 ) -> Result<(), Error> {
+    /// Ensure the file path is safe to use as a [`Path`].
+    ///
+    /// See: <https://docs.rs/zip/latest/zip/read/struct.ZipFile.html#method.enclosed_name>
+    pub(crate) fn enclosed_name(file_name: &str) -> Option<PathBuf> {
+        if file_name.contains('\0') {
+            return None;
+        }
+        let path = PathBuf::from(file_name);
+        let mut depth = 0usize;
+        for component in path.components() {
+            match component {
+                Component::Prefix(_) | Component::RootDir => return None,
+                Component::ParentDir => depth = depth.checked_sub(1)?,
+                Component::Normal(_) => depth += 1,
+                Component::CurDir => (),
+            }
+        }
+        Some(path)
+    }
+
     let target = target.as_ref();
     let mut reader = futures::io::BufReader::with_capacity(DEFAULT_BUF_SIZE, reader.compat());
     let mut zip = async_zip::base::read::stream::ZipFileReader::new(&mut reader);
@@ -28,6 +50,16 @@ pub async fn unzip<R: tokio::io::AsyncRead + Unpin>(
     while let Some(mut entry) = zip.next_with_entry().await? {
         // Construct the (expected) path to the file on-disk.
         let path = entry.reader().entry().filename().as_str()?;
+
+        // Sanitize the file name to prevent directory traversal attacks.
+        let Some(path) = enclosed_name(path) else {
+            warn!("Skipping unsafe file name: {path}");
+
+            // Close current file prior to proceeding, as per:
+            // https://docs.rs/async_zip/0.0.16/async_zip/base/read/stream/
+            zip = entry.skip().await?;
+            continue;
+        };
         let path = target.join(path);
         let is_dir = entry.reader().entry().dir()?;
 
@@ -55,7 +87,7 @@ pub async fn unzip<R: tokio::io::AsyncRead + Unpin>(
             tokio::io::copy(&mut reader, &mut writer).await?;
         }
 
-        // Close current file to get access to the next one. See docs:
+        // Close current file prior to proceeding, as per:
         // https://docs.rs/async_zip/0.0.16/async_zip/base/read/stream/
         zip = entry.skip().await?;
     }
@@ -84,6 +116,9 @@ pub async fn unzip<R: tokio::io::AsyncRead + Unpin>(
             if has_any_executable_bit != 0 {
                 // Construct the (expected) path to the file on-disk.
                 let path = entry.filename().as_str()?;
+                let Some(path) = enclosed_name(path) else {
+                    continue;
+                };
                 let path = target.join(path);
 
                 let permissions = fs_err::tokio::metadata(&path).await?.permissions();
@@ -104,10 +139,16 @@ pub async fn unzip<R: tokio::io::AsyncRead + Unpin>(
 /// Unpack the given tar archive into the destination directory.
 ///
 /// This is equivalent to `archive.unpack_in(dst)`, but it also preserves the executable bit.
-async fn untar_in<'a>(
-    mut archive: tokio_tar::Archive<&'a mut (dyn tokio::io::AsyncRead + Unpin)>,
+async fn untar_in(
+    mut archive: tokio_tar::Archive<&'_ mut (dyn tokio::io::AsyncRead + Unpin)>,
     dst: &Path,
 ) -> std::io::Result<()> {
+    // Like `tokio-tar`, canonicalize the destination prior to unpacking.
+    let dst = fs_err::tokio::canonicalize(dst).await?;
+
+    // Memoize filesystem calls to canonicalize paths.
+    let mut memo = FxHashSet::default();
+
     let mut entries = archive.entries()?;
     let mut pinned = Pin::new(&mut entries);
     while let Some(entry) = pinned.next().await {
@@ -124,7 +165,9 @@ async fn untar_in<'a>(
             continue;
         }
 
-        file.unpack_in(dst).await?;
+        // Unpack the file into the destination directory.
+        #[cfg_attr(not(unix), allow(unused_variables))]
+        let unpacked_at = file.unpack_in_raw(&dst, &mut memo).await?;
 
         // Preserve the executable bit.
         #[cfg(unix)]
@@ -137,7 +180,7 @@ async fn untar_in<'a>(
                 let mode = file.header().mode()?;
                 let has_any_executable_bit = mode & 0o111;
                 if has_any_executable_bit != 0 {
-                    if let Some(path) = crate::tar::unpacked_at(dst, &file.path()?) {
+                    if let Some(path) = unpacked_at.as_deref() {
                         let permissions = fs_err::tokio::metadata(&path).await?.permissions();
                         if permissions.mode() & 0o111 != 0o111 {
                             fs_err::tokio::set_permissions(
@@ -151,6 +194,7 @@ async fn untar_in<'a>(
             }
         }
     }
+
     Ok(())
 }
 
@@ -168,6 +212,7 @@ pub async fn untar_gz<R: tokio::io::AsyncRead + Unpin>(
         &mut decompressed_bytes as &mut (dyn tokio::io::AsyncRead + Unpin),
     )
     .set_preserve_mtime(false)
+    .set_preserve_permissions(false)
     .build();
     Ok(untar_in(archive, target.as_ref()).await?)
 }
@@ -186,6 +231,7 @@ pub async fn untar_bz2<R: tokio::io::AsyncRead + Unpin>(
         &mut decompressed_bytes as &mut (dyn tokio::io::AsyncRead + Unpin),
     )
     .set_preserve_mtime(false)
+    .set_preserve_permissions(false)
     .build();
     Ok(untar_in(archive, target.as_ref()).await?)
 }
@@ -204,6 +250,7 @@ pub async fn untar_zst<R: tokio::io::AsyncRead + Unpin>(
         &mut decompressed_bytes as &mut (dyn tokio::io::AsyncRead + Unpin),
     )
     .set_preserve_mtime(false)
+    .set_preserve_permissions(false)
     .build();
     Ok(untar_in(archive, target.as_ref()).await?)
 }
@@ -222,6 +269,7 @@ pub async fn untar_xz<R: tokio::io::AsyncRead + Unpin>(
         &mut decompressed_bytes as &mut (dyn tokio::io::AsyncRead + Unpin),
     )
     .set_preserve_mtime(false)
+    .set_preserve_permissions(false)
     .build();
     untar_in(archive, target.as_ref()).await?;
     Ok(())
@@ -239,6 +287,7 @@ pub async fn untar<R: tokio::io::AsyncRead + Unpin>(
     let archive =
         tokio_tar::ArchiveBuilder::new(&mut reader as &mut (dyn tokio::io::AsyncRead + Unpin))
             .set_preserve_mtime(false)
+            .set_preserve_permissions(false)
             .build();
     untar_in(archive, target.as_ref()).await?;
     Ok(())
