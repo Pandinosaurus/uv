@@ -5,7 +5,7 @@ use async_http_range_reader::AsyncHttpRangeReaderError;
 use async_zip::error::ZipError;
 use url::Url;
 
-use distribution_filename::{WheelFilename, WheelFilenameError};
+use uv_distribution_filename::{WheelFilename, WheelFilenameError};
 use uv_normalize::PackageName;
 
 use crate::html;
@@ -51,11 +51,17 @@ impl Error {
         matches!(err.kind(), std::io::ErrorKind::NotFound)
     }
 
+    /// Returns `true` if the error is due to an SSL error.
+    pub fn is_ssl(&self) -> bool {
+        matches!(&*self.kind, ErrorKind::WrappedReqwestError(.., err) if err.is_ssl())
+    }
+
     /// Returns `true` if the error is due to the server not supporting HTTP range requests.
     pub fn is_http_range_requests_unsupported(&self) -> bool {
         match &*self.kind {
             // The server doesn't support range requests (as reported by the `HEAD` check).
             ErrorKind::AsyncHttpRangeReader(
+                _,
                 AsyncHttpRangeReaderError::HttpRangeRequestUnsupported,
             ) => {
                 return true;
@@ -63,6 +69,7 @@ impl Error {
 
             // The server doesn't support range requests (it doesn't return the necessary headers).
             ErrorKind::AsyncHttpRangeReader(
+                _,
                 AsyncHttpRangeReaderError::ContentLengthMissing
                 | AsyncHttpRangeReaderError::ContentRangeMissing,
             ) => {
@@ -71,7 +78,7 @@ impl Error {
 
             // The server returned a "Method Not Allowed" error, indicating it doesn't support
             // HEAD requests, so we can't check for range requests.
-            ErrorKind::WrappedReqwestError(err) => {
+            ErrorKind::WrappedReqwestError(_url, err) => {
                 if let Some(status) = err.status() {
                     // If the server doesn't support HEAD requests, we can't check for range
                     // requests.
@@ -89,6 +96,12 @@ impl Error {
                     // In some cases, registries (like PyPICloud) return a 403 for HEAD requests
                     // when they're not supported. Again, it's better to be lenient here.
                     if status == reqwest::StatusCode::FORBIDDEN {
+                        return true;
+                    }
+
+                    // In some cases, registries (like Alibaba Cloud) return a 400 for HEAD requests
+                    // when they're not supported. Again, it's better to be lenient here.
+                    if status == reqwest::StatusCode::BAD_REQUEST {
                         return true;
                     }
                 }
@@ -137,10 +150,10 @@ impl From<ErrorKind> for Error {
 #[derive(Debug, thiserror::Error)]
 pub enum ErrorKind {
     #[error(transparent)]
-    UrlParse(#[from] url::ParseError),
+    InvalidUrl(#[from] uv_distribution_types::ToUrlError),
 
     #[error(transparent)]
-    JoinRelativeUrl(#[from] pypi_types::JoinRelativeError),
+    JoinRelativeUrl(#[from] uv_pypi_types::JoinRelativeError),
 
     #[error("Expected a file URL, but received: {0}")]
     NonFileUrl(Url),
@@ -170,7 +183,7 @@ pub enum ErrorKind {
     MetadataParseError(
         WheelFilename,
         String,
-        #[source] Box<pypi_types::MetadataError>,
+        #[source] Box<uv_pypi_types::MetadataError>,
     ),
 
     /// The metadata file was not found in the wheel.
@@ -178,8 +191,8 @@ pub enum ErrorKind {
     MetadataNotFound(WheelFilename, String),
 
     /// An error that happened while making a request or in a reqwest middleware.
-    #[error(transparent)]
-    WrappedReqwestError(#[from] WrappedReqwestError),
+    #[error("Failed to fetch: `{0}`")]
+    WrappedReqwestError(Url, #[source] WrappedReqwestError),
 
     #[error("Received some unexpected JSON from {url}")]
     BadJson { source: serde_json::Error, url: Url },
@@ -187,8 +200,8 @@ pub enum ErrorKind {
     #[error("Received some unexpected HTML from {url}")]
     BadHtml { source: html::Error, url: Url },
 
-    #[error(transparent)]
-    AsyncHttpRangeReader(#[from] AsyncHttpRangeReaderError),
+    #[error("Failed to read zip with range requests: `{0}`")]
+    AsyncHttpRangeReader(Url, #[source] AsyncHttpRangeReaderError),
 
     #[error("{0} is not a valid wheel filename")]
     WheelFilename(#[source] WheelFilenameError),
@@ -206,7 +219,7 @@ pub enum ErrorKind {
     CacheWrite(#[source] std::io::Error),
 
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
 
     #[error("Cache deserialization failed")]
     Decode(#[source] rmp_serde::decode::Error),
@@ -227,27 +240,25 @@ pub enum ErrorKind {
     ArchiveRead(String),
 
     #[error("Writing to cache archive failed: {0}")]
-    ArchiveWrite(#[source] crate::rkyvutil::SerializerError),
+    ArchiveWrite(String),
 
     #[error("Network connectivity is disabled, but the requested data wasn't found in the cache for: `{0}`")]
     Offline(String),
 }
 
-impl From<reqwest::Error> for ErrorKind {
-    fn from(error: reqwest::Error) -> Self {
-        Self::WrappedReqwestError(WrappedReqwestError::from(error))
+impl ErrorKind {
+    pub(crate) fn from_reqwest(url: Url, error: reqwest::Error) -> Self {
+        Self::WrappedReqwestError(url, WrappedReqwestError::from(error))
     }
-}
 
-impl From<reqwest_middleware::Error> for ErrorKind {
-    fn from(err: reqwest_middleware::Error) -> Self {
+    pub(crate) fn from_reqwest_middleware(url: Url, err: reqwest_middleware::Error) -> Self {
         if let reqwest_middleware::Error::Middleware(ref underlying) = err {
             if let Some(err) = underlying.downcast_ref::<OfflineError>() {
                 return Self::Offline(err.url().to_string());
             }
         }
 
-        Self::WrappedReqwestError(WrappedReqwestError(err))
+        Self::WrappedReqwestError(url, WrappedReqwestError(err))
     }
 }
 
@@ -260,13 +271,9 @@ impl From<reqwest_middleware::Error> for ErrorKind {
 pub struct WrappedReqwestError(reqwest_middleware::Error);
 
 impl WrappedReqwestError {
-    /// Check if the error chain contains a reqwest error that looks like this:
-    /// * error sending request for url (...)
-    /// * client error (Connect)
-    /// * dns error: failed to lookup address information: Name or service not known
-    /// * failed to lookup address information: Name or service not known
-    fn is_likely_offline(&self) -> bool {
-        let reqwest_err = match &self.0 {
+    /// Return the inner [`reqwest::Error`] from the error chain, if it exists.
+    fn inner(&self) -> Option<&reqwest::Error> {
+        match &self.0 {
             reqwest_middleware::Error::Reqwest(err) => Some(err),
             reqwest_middleware::Error::Middleware(err) => err.chain().find_map(|err| {
                 if let Some(err) = err.downcast_ref::<reqwest::Error>() {
@@ -279,9 +286,16 @@ impl WrappedReqwestError {
                     None
                 }
             }),
-        };
+        }
+    }
 
-        if let Some(reqwest_err) = reqwest_err {
+    /// Check if the error chain contains a `reqwest` error that looks like this:
+    /// * error sending request for url (...)
+    /// * client error (Connect)
+    /// * dns error: failed to lookup address information: Name or service not known
+    /// * failed to lookup address information: Name or service not known
+    fn is_likely_offline(&self) -> bool {
+        if let Some(reqwest_err) = self.inner() {
             if !reqwest_err.is_connect() {
                 return false;
             }
@@ -291,6 +305,26 @@ impl WrappedReqwestError {
             if std::error::Error::source(&reqwest_err)
                 .and_then(|err| err.source())
                 .is_some_and(|err| err.to_string().starts_with("dns error: "))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if the error chain contains a `reqwest` error that looks like this:
+    /// * invalid peer certificate: `UnknownIssuer`
+    fn is_ssl(&self) -> bool {
+        if let Some(reqwest_err) = self.inner() {
+            if !reqwest_err.is_connect() {
+                return false;
+            }
+            // Self is "error sending request for url", the first source is "error trying to connect",
+            // the second source is "dns error". We have to check for the string because hyper errors
+            // are opaque.
+            if std::error::Error::source(&reqwest_err)
+                .and_then(|err| err.source())
+                .is_some_and(|err| err.to_string().starts_with("invalid peer certificate: "))
             {
                 return true;
             }
@@ -322,8 +356,10 @@ impl Deref for WrappedReqwestError {
 impl Display for WrappedReqwestError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         if self.is_likely_offline() {
+            // Insert an extra hint, we'll show the wrapped error through `source`
             f.write_str("Could not connect, are you offline?")
         } else {
+            // Show the wrapped error
             Display::fmt(&self.0, f)
         }
     }
@@ -332,11 +368,10 @@ impl Display for WrappedReqwestError {
 impl std::error::Error for WrappedReqwestError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         if self.is_likely_offline() {
-            match &self.0 {
-                reqwest_middleware::Error::Middleware(err) => Some(err.as_ref()),
-                reqwest_middleware::Error::Reqwest(err) => Some(err),
-            }
+            // `Display` is inserting an extra message, so we need to show the wrapped error
+            Some(&self.0)
         } else {
+            // `Display` is showing the wrapped error, continue with its source
             self.0.source()
         }
     }

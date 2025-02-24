@@ -2,8 +2,8 @@ use std::fmt::{Display, Formatter};
 use std::ops::Deref;
 use std::str::FromStr;
 
-use pep440_rs::Version;
-use pep508_rs::{MarkerEnvironment, StringVersion};
+use uv_pep440::Version;
+use uv_pep508::{MarkerEnvironment, StringVersion};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PythonVersion(StringVersion);
@@ -50,7 +50,9 @@ impl schemars::JsonSchema for PythonVersion {
                 ..schemars::schema::StringValidation::default()
             })),
             metadata: Some(Box::new(schemars::schema::Metadata {
-                description: Some("A Python version specifier, e.g. `3.7` or `3.8.0`.".to_string()),
+                description: Some(
+                    "A Python version specifier, e.g. `3.11` or `3.12.4`.".to_string(),
+                ),
                 ..schemars::schema::Metadata::default()
             })),
             ..schemars::schema::SchemaObject::default()
@@ -171,7 +173,7 @@ impl PythonVersion {
 mod tests {
     use std::str::FromStr;
 
-    use pep440_rs::{Prerelease, PrereleaseKind, Version};
+    use uv_pep440::{Prerelease, PrereleaseKind, Version};
 
     use crate::PythonVersion;
 

@@ -2,7 +2,7 @@
 
 ## Dependency caching
 
-uv uses aggressive caching to avoid re-downloading (and re-building dependencies) that have already
+uv uses aggressive caching to avoid re-downloading (and re-building) dependencies that have already
 been accessed in prior runs.
 
 The specifics of uv's caching semantics vary based on the nature of the dependency:
@@ -21,7 +21,7 @@ If you're running into caching issues, uv includes a few escape hatches:
 
 - To force uv to revalidate cached data for all dependencies, pass `--refresh` to any command (e.g.,
   `uv sync --refresh` or `uv pip install --refresh ...`).
-- To force uv to revalidate cached data for a specific dependency pass `--refresh-dependency` to any
+- To force uv to revalidate cached data for a specific dependency pass `--refresh-package` to any
   command (e.g., `uv sync --refresh-package flask` or `uv pip install --refresh-package flask ...`).
 - To force uv to ignore existing installed versions, pass `--reinstall` to any installation command
   (e.g., `uv sync --reinstall` or `uv pip install --reinstall ...`).
@@ -41,7 +41,15 @@ should be rebuilt whenever the commit hash changes, you can add the following to
 
 ```toml title="pyproject.toml"
 [tool.uv]
-cache-keys = [{ git = true }]
+cache-keys = [{ git = { commit = true } }]
+```
+
+If your dynamic metadata incorporates information from the set of Git tags, you can expand the cache
+key to include the tags:
+
+```toml title="pyproject.toml"
+[tool.uv]
+cache-keys = [{ git = { commit = true, tags = true } }]
 ```
 
 Similarly, if a project reads from a `requirements.txt` to populate its dependencies, you can add
@@ -66,6 +74,14 @@ cache-keys = [{ file = "**/*.toml" }]
 
     The use of globs can be expensive, as uv may need to walk the filesystem to determine whether any files have changed.
     This may, in turn, requiring traversal of large or deeply nested directories.
+
+Similarly, if a project relies on an environment variable, you can add the following to the
+project's `pyproject.toml` to invalidate the cache whenever the environment variable changes:
+
+```toml title="pyproject.toml"
+[tool.uv]
+cache-keys = [{ env = "MY_ENV_VAR" }]
+```
 
 As an escape hatch, if a project uses `dynamic` metadata that isn't covered by `tool.uv.cache-keys`,
 you can instruct uv to _always_ rebuild and reinstall it by adding the project to the
@@ -141,3 +157,22 @@ uv determines the cache directory according to, in order:
 It is important for performance for the cache directory to be located on the same file system as the
 Python environment uv is operating on. Otherwise, uv will not be able to link files from the cache
 into the environment and will instead need to fallback to slow copy operations.
+
+## Cache versioning
+
+The uv cache is composed of a number of buckets (e.g., a bucket for wheels, a bucket for source
+distributions, a bucket for Git repositories, and so on). Each bucket is versioned, such that if a
+release contains a breaking change to the cache format, uv will not attempt to read from or write to
+an incompatible cache bucket.
+
+For example, uv 0.4.13 included a breaking change to the core metadata bucket. As such, the bucket
+version was increased from v12 to v13. Within a cache version, changes are guaranteed to be both
+forwards- and backwards-compatible.
+
+Since changes in the cache format are accompanied by changes in the cache version, multiple versions
+of uv can safely read and write to the same cache directory. However, if the cache version changed
+between a given pair of uv releases, then those releases may not be able to share the same
+underlying cache entries.
+
+For example, it's safe to use a single shared cache for uv 0.4.12 and uv 0.4.13, though the cache
+itself may contain duplicate entries in the core metadata bucket due to the change in cache version.

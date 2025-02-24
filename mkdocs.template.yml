@@ -4,6 +4,7 @@ theme:
   logo: assets/logo-letter.svg
   favicon: assets/favicon.ico
   features:
+    - navigation.path
     - navigation.instant
     - navigation.instant.prefetch
     - navigation.instant.progress
@@ -42,11 +43,12 @@ site_dir: site/uv
 markdown_extensions:
   - admonition
   - pymdownx.details
-  - toc:
-      permalink: "#"
   - pymdownx.snippets:
   - pymdownx.magiclink:
   - attr_list:
+  - toc:
+      anchorlink: true
+      anchorlink_class: "toclink"
   - md_in_html:
   - pymdownx.inlinehilite:
   - pymdownx.superfences:
@@ -60,7 +62,18 @@ markdown_extensions:
       alternate_style: true
 plugins:
   - search
-  - typeset
+  - git-revision-date-localized:
+      timezone: UTC # It can only be in UTC unless the ISO time can include timezone.
+  - redirects:
+      # Note that redirecting an anchor, e.g., `concepts/projects/#managing-dependencies` must be done
+      # client-side and is implemented in `extra.js` instead.
+      redirect_maps:
+        "guides/publish.md": "guides/package.md"
+        "concepts/workspaces.md": "concepts/projects/workspaces.md"
+        "concepts/dependencies.md": "concepts/projects/dependencies.md"
+        "reference/versioning.md": "reference/policies/versioning.md"
+        "reference/platforms.md": "reference/policies/platforms.md"
+        "reference/build_failures.md": "reference/troubleshooting/build-failures.md"
 extra_css:
   - stylesheets/extra.css
 extra_javascript:
@@ -91,12 +104,31 @@ nav:
       - Running scripts: guides/scripts.md
       - Using tools: guides/tools.md
       - Working on projects: guides/projects.md
-      - Publishing packages: guides/publish.md
+      - Publishing packages: guides/package.md
+      - Integrations:
+          - guides/integration/index.md
+          - Docker: guides/integration/docker.md
+          - Jupyter: guides/integration/jupyter.md
+          - GitHub Actions: guides/integration/github.md
+          - GitLab CI/CD: guides/integration/gitlab.md
+          - Pre-commit: guides/integration/pre-commit.md
+          - PyTorch: guides/integration/pytorch.md
+          - FastAPI: guides/integration/fastapi.md
+          - Alternative indexes: guides/integration/alternative-indexes.md
+          - Dependency bots: guides/integration/dependency-bots.md
+          - AWS Lambda: guides/integration/aws-lambda.md
   - Concepts:
       - concepts/index.md
-      - Projects: concepts/projects.md
-      - Dependencies: concepts/dependencies.md
-      - Workspaces: concepts/workspaces.md
+      - Projects:
+          - concepts/projects/index.md
+          - Structure and files: concepts/projects/layout.md
+          - Creating projects: concepts/projects/init.md
+          - Managing dependencies: concepts/projects/dependencies.md
+          - Running commands: concepts/projects/run.md
+          - Locking and syncing: concepts/projects/sync.md
+          - Configuring projects: concepts/projects/config.md
+          - Building distributions: concepts/projects/build.md
+          - Using workspaces: concepts/projects/workspaces.md
       - Tools: concepts/tools.md
       - Python versions: concepts/python-versions.md
       - Resolution: concepts/resolution.md
@@ -106,14 +138,8 @@ nav:
       - Configuration files: configuration/files.md
       - Environment variables: configuration/environment.md
       - Authentication: configuration/authentication.md
-  - Integration guides:
-      - guides/integration/index.md
-      - Docker: guides/integration/docker.md
-      - GitHub Actions: guides/integration/github.md
-      - Pre-commit: guides/integration/pre-commit.md
-      - FastAPI: guides/integration/fastapi.md
-      - Alternative indexes: guides/integration/alternative-indexes.md
-      - Dependency bots: guides/integration/dependency-bots.md
+      - Package indexes: configuration/indexes.md
+      - Installer: configuration/installer.md
   - The pip interface:
       - pip/index.md
       - Using environments: pip/environments.md
@@ -126,10 +152,17 @@ nav:
       - reference/index.md
       - Commands: reference/cli.md
       - Settings: reference/settings.md
+      - Troubleshooting:
+          - reference/troubleshooting/index.md
+          - Build failures: reference/troubleshooting/build-failures.md
+          - Reproducible examples: reference/troubleshooting/reproducible-examples.md
       - Resolver: reference/resolver-internals.md
       - Benchmarks: reference/benchmarks.md
-      - Versioning: reference/versioning.md
-      - Platform support: reference/platforms.md
+      - Policies:
+          - reference/policies/index.md
+          - Versioning: reference/policies/versioning.md
+          - Platform support: reference/policies/platforms.md
+          - License: reference/policies/license.md
 validation:
   omitted_files: warn
   absolute_links: warn

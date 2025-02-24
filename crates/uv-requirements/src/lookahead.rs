@@ -3,34 +3,21 @@ use std::{collections::VecDeque, sync::Arc};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use rustc_hash::FxHashSet;
-use thiserror::Error;
 use tracing::trace;
 
-use distribution_types::{BuiltDist, Dist, DistributionMetadata, GitSourceDist, SourceDist};
-use pypi_types::{Requirement, RequirementSource};
 use uv_configuration::{Constraints, Overrides};
 use uv_distribution::{DistributionDatabase, Reporter};
-use uv_git::GitUrl;
-use uv_normalize::GroupName;
-use uv_resolver::{InMemoryIndex, MetadataResponse, ResolverMarkers};
+use uv_distribution_types::{Dist, DistributionMetadata};
+use uv_pypi_types::{Requirement, RequirementSource};
+use uv_resolver::{InMemoryIndex, MetadataResponse, ResolverEnvironment};
 use uv_types::{BuildContext, HashStrategy, RequestedRequirements};
 
-#[derive(Debug, Error)]
-pub enum LookaheadError {
-    #[error("Failed to download: `{0}`")]
-    Download(BuiltDist, #[source] uv_distribution::Error),
-    #[error("Failed to download and build: `{0}`")]
-    DownloadAndBuild(SourceDist, #[source] uv_distribution::Error),
-    #[error("Failed to build: `{0}`")]
-    Build(SourceDist, #[source] uv_distribution::Error),
-    #[error(transparent)]
-    UnsupportedUrl(#[from] distribution_types::Error),
-}
+use crate::{required_dist, Error};
 
 /// A resolver for resolving lookahead requirements from direct URLs.
 ///
 /// The resolver extends certain privileges to "first-party" requirements. For example, first-party
-/// requirements are allowed to contain direct URL references, local version specifiers, and more.
+/// requirements are allowed to contain direct URL references.
 ///
 /// The lookahead resolver resolves requirements recursively for direct URLs, so that the resolver
 /// can treat them as first-party dependencies for the purpose of analyzing their specifiers.
@@ -50,8 +37,6 @@ pub struct LookaheadResolver<'a, Context: BuildContext> {
     constraints: &'a Constraints,
     /// The overrides for the project.
     overrides: &'a Overrides,
-    /// The development dependency groups for the project.
-    dev: &'a [GroupName],
     /// The required hashes for the project.
     hasher: &'a HashStrategy,
     /// The in-memory index for resolving dependencies.
@@ -66,7 +51,6 @@ impl<'a, Context: BuildContext> LookaheadResolver<'a, Context> {
         requirements: &'a [Requirement],
         constraints: &'a Constraints,
         overrides: &'a Overrides,
-        dev: &'a [GroupName],
         hasher: &'a HashStrategy,
         index: &'a InMemoryIndex,
         database: DistributionDatabase<'a, Context>,
@@ -75,7 +59,6 @@ impl<'a, Context: BuildContext> LookaheadResolver<'a, Context> {
             requirements,
             constraints,
             overrides,
-            dev,
             hasher,
             index,
             database,
@@ -84,7 +67,7 @@ impl<'a, Context: BuildContext> LookaheadResolver<'a, Context> {
 
     /// Set the [`Reporter`] to use for this resolver.
     #[must_use]
-    pub fn with_reporter(self, reporter: impl Reporter + 'static) -> Self {
+    pub fn with_reporter(self, reporter: Arc<dyn Reporter>) -> Self {
         Self {
             database: self.database.with_reporter(reporter),
             ..self
@@ -99,8 +82,8 @@ impl<'a, Context: BuildContext> LookaheadResolver<'a, Context> {
     /// to "only evaluate marker expressions that reference an extra name.")
     pub async fn resolve(
         self,
-        markers: &ResolverMarkers,
-    ) -> Result<Vec<RequestedRequirements>, LookaheadError> {
+        env: &ResolverEnvironment,
+    ) -> Result<Vec<RequestedRequirements>, Error> {
         let mut results = Vec::new();
         let mut futures = FuturesUnordered::new();
         let mut seen = FxHashSet::default();
@@ -109,7 +92,7 @@ impl<'a, Context: BuildContext> LookaheadResolver<'a, Context> {
         let mut queue: VecDeque<_> = self
             .constraints
             .apply(self.overrides.apply(self.requirements))
-            .filter(|requirement| requirement.evaluate_markers(markers.marker_environment(), &[]))
+            .filter(|requirement| requirement.evaluate_markers(env.marker_environment(), &[]))
             .map(|requirement| (*requirement).clone())
             .collect();
 
@@ -129,7 +112,7 @@ impl<'a, Context: BuildContext> LookaheadResolver<'a, Context> {
                         .apply(self.overrides.apply(lookahead.requirements()))
                     {
                         if requirement
-                            .evaluate_markers(markers.marker_environment(), lookahead.extras())
+                            .evaluate_markers(env.marker_environment(), lookahead.extras())
                         {
                             queue.push_back((*requirement).clone());
                         }
@@ -146,7 +129,7 @@ impl<'a, Context: BuildContext> LookaheadResolver<'a, Context> {
     async fn lookahead(
         &self,
         requirement: Requirement,
-    ) -> Result<Option<RequestedRequirements>, LookaheadError> {
+    ) -> Result<Option<RequestedRequirements>, Error> {
         trace!("Performing lookahead for {requirement}");
 
         // Determine whether the requirement represents a local distribution and convert to a
@@ -155,40 +138,23 @@ impl<'a, Context: BuildContext> LookaheadResolver<'a, Context> {
             return Ok(None);
         };
 
+        // Consider the dependencies to be "direct" if the requirement is a local source tree.
+        let direct = if let Dist::Source(source_dist) = &dist {
+            source_dist.as_path().is_some_and(std::path::Path::is_dir)
+        } else {
+            false
+        };
+
         // Fetch the metadata for the distribution.
         let metadata = {
             let id = dist.version_id();
-            if let Some(archive) =
-                self.index
-                    .distributions()
-                    .get(&id)
-                    .as_deref()
-                    .and_then(|response| {
-                        if let MetadataResponse::Found(archive, ..) = response {
-                            Some(archive)
-                        } else {
-                            None
-                        }
-                    })
-            {
-                // If the metadata is already in the index, return it.
-                archive.metadata.clone()
-            } else {
+            if self.index.distributions().register(id.clone()) {
                 // Run the PEP 517 build process to extract metadata from the source distribution.
                 let archive = self
                     .database
                     .get_or_build_wheel_metadata(&dist, self.hasher.get(&dist))
                     .await
-                    .map_err(|err| match &dist {
-                        Dist::Built(built) => LookaheadError::Download(built.clone(), err),
-                        Dist::Source(source) => {
-                            if source.is_local() {
-                                LookaheadError::Build(source.clone(), err)
-                            } else {
-                                LookaheadError::DownloadAndBuild(source.clone(), err)
-                            }
-                        }
-                    })?;
+                    .map_err(|err| Error::from_dist(dist, err))?;
 
                 let metadata = archive.metadata.clone();
 
@@ -198,6 +164,17 @@ impl<'a, Context: BuildContext> LookaheadResolver<'a, Context> {
                     .done(id, Arc::new(MetadataResponse::Found(archive)));
 
                 metadata
+            } else {
+                let response = self
+                    .index
+                    .distributions()
+                    .wait(&id)
+                    .await
+                    .expect("missing value for registered task");
+                let MetadataResponse::Found(archive) = &*response else {
+                    panic!("Failed to find metadata for: {requirement}");
+                };
+                archive.metadata.clone()
             }
         };
 
@@ -207,10 +184,10 @@ impl<'a, Context: BuildContext> LookaheadResolver<'a, Context> {
             .into_iter()
             .chain(
                 metadata
-                    .dev_dependencies
+                    .dependency_groups
                     .into_iter()
                     .filter_map(|(group, dependencies)| {
-                        if self.dev.contains(&group) {
+                        if requirement.groups.contains(&group) {
                             Some(dependencies)
                         } else {
                             None
@@ -230,13 +207,6 @@ impl<'a, Context: BuildContext> LookaheadResolver<'a, Context> {
             })
             .collect();
 
-        // Consider the dependencies to be "direct" if the requirement is a local source tree.
-        let direct = if let Dist::Source(source_dist) = &dist {
-            source_dist.as_path().is_some_and(std::path::Path::is_dir)
-        } else {
-            false
-        };
-
         // Return the requirements from the metadata.
         Ok(Some(RequestedRequirements::new(
             requirement.extras,
@@ -244,59 +214,4 @@ impl<'a, Context: BuildContext> LookaheadResolver<'a, Context> {
             direct,
         )))
     }
-}
-
-/// Convert a [`Requirement`] into a [`Dist`], if it is a direct URL.
-fn required_dist(requirement: &Requirement) -> Result<Option<Dist>, distribution_types::Error> {
-    Ok(Some(match &requirement.source {
-        RequirementSource::Registry { .. } => return Ok(None),
-        RequirementSource::Url {
-            subdirectory,
-            location,
-            ext,
-            url,
-        } => Dist::from_http_url(
-            requirement.name.clone(),
-            url.clone(),
-            location.clone(),
-            subdirectory.clone(),
-            *ext,
-        )?,
-        RequirementSource::Git {
-            repository,
-            reference,
-            precise,
-            subdirectory,
-            url,
-        } => {
-            let git_url = if let Some(precise) = precise {
-                GitUrl::from_commit(repository.clone(), reference.clone(), *precise)
-            } else {
-                GitUrl::from_reference(repository.clone(), reference.clone())
-            };
-            Dist::Source(SourceDist::Git(GitSourceDist {
-                name: requirement.name.clone(),
-                git: Box::new(git_url),
-                subdirectory: subdirectory.clone(),
-                url: url.clone(),
-            }))
-        }
-        RequirementSource::Path {
-            install_path,
-            ext,
-            url,
-        } => Dist::from_file_url(requirement.name.clone(), url.clone(), install_path, *ext)?,
-        RequirementSource::Directory {
-            install_path,
-            r#virtual,
-            url,
-            editable,
-        } => Dist::from_directory_url(
-            requirement.name.clone(),
-            url.clone(),
-            install_path,
-            *editable,
-            *r#virtual,
-        )?,
-    }))
 }

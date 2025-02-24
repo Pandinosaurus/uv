@@ -9,6 +9,8 @@ use std::io::Read;
 use std::io::Write;
 use url::Url;
 
+use uv_static::EnvVars;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Credentials {
     /// The name of the user for authentication.
@@ -74,7 +76,7 @@ impl Credentials {
         }
     }
 
-    pub(crate) fn username(&self) -> Option<&str> {
+    pub fn username(&self) -> Option<&str> {
         self.username.as_deref()
     }
 
@@ -82,7 +84,7 @@ impl Credentials {
         self.username.clone()
     }
 
-    pub(crate) fn password(&self) -> Option<&str> {
+    pub fn password(&self) -> Option<&str> {
         self.password.as_deref()
     }
 
@@ -125,18 +127,34 @@ impl Credentials {
                 None
             } else {
                 Some(
-                    urlencoding::decode(url.username())
+                    percent_encoding::percent_decode_str(url.username())
+                        .decode_utf8()
                         .expect("An encoded username should always decode")
                         .into_owned(),
                 )
             }
             .into(),
             password: url.password().map(|password| {
-                urlencoding::decode(password)
+                percent_encoding::percent_decode_str(password)
+                    .decode_utf8()
                     .expect("An encoded password should always decode")
                     .into_owned()
             }),
         })
+    }
+
+    /// Extract the [`Credentials`] from the environment, given a named source.
+    ///
+    /// For example, given a name of `"pytorch"`, search for `UV_INDEX_PYTORCH_USERNAME` and
+    /// `UV_INDEX_PYTORCH_PASSWORD`.
+    pub fn from_env(name: impl AsRef<str>) -> Option<Self> {
+        let username = std::env::var(EnvVars::index_username(name.as_ref())).ok();
+        let password = std::env::var(EnvVars::index_password(name.as_ref())).ok();
+        if username.is_none() && password.is_none() {
+            None
+        } else {
+            Some(Self::new(username, password))
+        }
     }
 
     /// Parse [`Credentials`] from an HTTP request, if any.
@@ -221,7 +239,7 @@ impl Credentials {
     ///
     /// Any existing credentials will be overridden.
     #[must_use]
-    pub(crate) fn authenticate(&self, mut request: reqwest::Request) -> reqwest::Request {
+    pub(crate) fn authenticate(&self, mut request: Request) -> Request {
         request
             .headers_mut()
             .insert(reqwest::header::AUTHORIZATION, Self::to_header_value(self));
@@ -230,7 +248,7 @@ impl Credentials {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use insta::assert_debug_snapshot;
 
     use super::*;
@@ -280,7 +298,7 @@ mod test {
         auth_url.set_password(Some("password")).unwrap();
         let credentials = Credentials::from_url(&auth_url).unwrap();
 
-        let mut request = reqwest::Request::new(reqwest::Method::GET, url);
+        let mut request = Request::new(reqwest::Method::GET, url);
         request = credentials.authenticate(request);
 
         let mut header = request
@@ -302,7 +320,7 @@ mod test {
         auth_url.set_password(Some("password")).unwrap();
         let credentials = Credentials::from_url(&auth_url).unwrap();
 
-        let mut request = reqwest::Request::new(reqwest::Method::GET, url);
+        let mut request = Request::new(reqwest::Method::GET, url);
         request = credentials.authenticate(request);
 
         let mut header = request
@@ -324,7 +342,7 @@ mod test {
         auth_url.set_password(Some("password==")).unwrap();
         let credentials = Credentials::from_url(&auth_url).unwrap();
 
-        let mut request = reqwest::Request::new(reqwest::Method::GET, url);
+        let mut request = Request::new(reqwest::Method::GET, url);
         request = credentials.authenticate(request);
 
         let mut header = request
