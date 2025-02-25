@@ -1,12 +1,17 @@
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
-use distribution_types::IndexUrl;
-use install_wheel_rs::linker::LinkMode;
-use pypi_types::SupportedEnvironments;
-use uv_configuration::{ConfigSettings, IndexStrategy, KeyringProviderType, TargetTriple};
+use url::Url;
+
+use uv_configuration::{
+    ConfigSettings, IndexStrategy, KeyringProviderType, RequiredVersion, TargetTriple,
+    TrustedPublishing,
+};
+use uv_distribution_types::{Index, IndexUrl, PipExtraIndex, PipFindLinks, PipIndex};
+use uv_install_wheel::LinkMode;
+use uv_pypi_types::{SchemaConflicts, SupportedEnvironments};
 use uv_python::{PythonDownloads, PythonPreference, PythonVersion};
-use uv_resolver::{AnnotationStyle, ExcludeNewer, PrereleaseMode, ResolutionMode};
+use uv_resolver::{AnnotationStyle, ExcludeNewer, ForkStrategy, PrereleaseMode, ResolutionMode};
 
 use crate::{FilesystemOptions, Options, PipOptions};
 
@@ -69,20 +74,29 @@ macro_rules! impl_combine_or {
 
 impl_combine_or!(AnnotationStyle);
 impl_combine_or!(ExcludeNewer);
+impl_combine_or!(ForkStrategy);
+impl_combine_or!(Index);
 impl_combine_or!(IndexStrategy);
 impl_combine_or!(IndexUrl);
 impl_combine_or!(KeyringProviderType);
 impl_combine_or!(LinkMode);
 impl_combine_or!(NonZeroUsize);
 impl_combine_or!(PathBuf);
+impl_combine_or!(PipExtraIndex);
+impl_combine_or!(PipFindLinks);
+impl_combine_or!(PipIndex);
 impl_combine_or!(PrereleaseMode);
 impl_combine_or!(PythonDownloads);
 impl_combine_or!(PythonPreference);
 impl_combine_or!(PythonVersion);
+impl_combine_or!(RequiredVersion);
 impl_combine_or!(ResolutionMode);
+impl_combine_or!(SchemaConflicts);
 impl_combine_or!(String);
 impl_combine_or!(SupportedEnvironments);
 impl_combine_or!(TargetTriple);
+impl_combine_or!(TrustedPublishing);
+impl_combine_or!(Url);
 impl_combine_or!(bool);
 
 impl<T> Combine for Option<Vec<T>> {
@@ -111,6 +125,12 @@ impl Combine for Option<ConfigSettings> {
 }
 
 impl Combine for serde::de::IgnoredAny {
+    fn combine(self, _other: Self) -> Self {
+        self
+    }
+}
+
+impl Combine for Option<serde::de::IgnoredAny> {
     fn combine(self, _other: Self) -> Self {
         self
     }

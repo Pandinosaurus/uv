@@ -1,41 +1,48 @@
 from __future__ import annotations
 
 import os
-import sys
-import sysconfig
+
+if os.environ.get("UV_PREVIEW"):
+    from ._build_backend import *
+from ._find_uv import find_uv_bin
+
+if os.environ.get("UV_PREVIEW"):
+    __all__ = [
+        "find_uv_bin",
+        # PEP 517 hook `build_sdist`.
+        "build_sdist",
+        # PEP 517 hook `build_wheel`.
+        "build_wheel",
+        # PEP 660 hook `build_editable`.
+        "build_editable",
+        # PEP 517 hook `get_requires_for_build_sdist`.
+        "get_requires_for_build_sdist",
+        # PEP 517 hook `get_requires_for_build_wheel`.
+        "get_requires_for_build_wheel",
+        # PEP 517 hook `prepare_metadata_for_build_wheel`.
+        "prepare_metadata_for_build_wheel",
+        # PEP 660 hook `get_requires_for_build_editable`.
+        "get_requires_for_build_editable",
+        # PEP 660 hook `prepare_metadata_for_build_editable`.
+        "prepare_metadata_for_build_editable",
+    ]
+else:
+    __all__ = ["find_uv_bin"]
 
 
-def find_uv_bin() -> str:
-    """Return the uv binary path."""
+def __getattr__(attr_name: str) -> object:
+    if attr_name in {
+        "build_sdist",
+        "build_wheel",
+        "build_editable",
+        "get_requires_for_build_sdist",
+        "get_requires_for_build_wheel",
+        "prepare_metadata_for_build_wheel",
+        "get_requires_for_build_editable",
+        "prepare_metadata_for_build_editable",
+    }:
+        err = f"Using `uv.{attr_name}` is not allowed. The uv build backend requires preview mode to be enabled, e.g., via the `UV_PREVIEW=1` environment variable."
+        raise AttributeError(err)
 
-    uv_exe = "uv" + sysconfig.get_config_var("EXE")
-
-    path = os.path.join(sysconfig.get_path("scripts"), uv_exe)
-    if os.path.isfile(path):
-        return path
-
-    if sys.version_info >= (3, 10):
-        user_scheme = sysconfig.get_preferred_scheme("user")
-    elif os.name == "nt":
-        user_scheme = "nt_user"
-    elif sys.platform == "darwin" and sys._framework:
-        user_scheme = "osx_framework_user"
-    else:
-        user_scheme = "posix_user"
-
-    path = os.path.join(sysconfig.get_path("scripts", scheme=user_scheme), uv_exe)
-    if os.path.isfile(path):
-        return path
-
-    # Search in `bin` adjacent to package root (as created by `pip install --target`).
-    pkg_root = os.path.dirname(os.path.dirname(__file__))
-    target_path = os.path.join(pkg_root, "bin", uv_exe)
-    if os.path.isfile(target_path):
-        return target_path
-
-    raise FileNotFoundError(path)
-
-
-__all__ = [
-    "find_uv_bin",
-]
+    err = f"module 'uv' has no attribute '{attr_name}'"
+    raise AttributeError(err)

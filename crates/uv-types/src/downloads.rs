@@ -1,8 +1,9 @@
-use distribution_types::{CachedDist, DistributionId};
-use once_map::OnceMap;
+use std::sync::Arc;
+use uv_distribution_types::{CachedDist, DistributionId};
+use uv_once_map::OnceMap;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct InFlight {
     /// The in-flight distribution downloads.
-    pub downloads: OnceMap<DistributionId, Result<CachedDist, String>>,
+    pub downloads: Arc<OnceMap<DistributionId, Result<CachedDist, String>>>,
 }

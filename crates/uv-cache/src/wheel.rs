@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use url::Url;
 
-use cache_key::{cache_digest, CanonicalUrl};
-use distribution_types::IndexUrl;
+use uv_cache_key::{cache_digest, CanonicalUrl};
+use uv_distribution_types::IndexUrl;
 
 /// Cache wheels and their metadata, both from remote wheels and built from source distributions.
 #[derive(Debug, Clone)]
@@ -23,7 +23,7 @@ pub enum WheelCache<'a> {
     Git(&'a Url, &'a str),
 }
 
-impl<'a> WheelCache<'a> {
+impl WheelCache<'_> {
     /// The root directory for a cache bucket.
     pub fn root(&self) -> PathBuf {
         match self {

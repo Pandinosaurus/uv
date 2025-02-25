@@ -7,14 +7,14 @@ use fs_err as fs;
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use url::Url;
 
-use distribution_types::{
+use uv_distribution_types::{
     Diagnostic, InstalledDist, Name, NameRequirementSpecification, UnresolvedRequirement,
     UnresolvedRequirementSpecification,
 };
-use pep440_rs::{Version, VersionSpecifiers};
-use pypi_types::{Requirement, ResolverMarkerEnvironment, VerbatimParsedUrl};
 use uv_fs::Simplified;
 use uv_normalize::PackageName;
+use uv_pep440::{Version, VersionSpecifiers};
+use uv_pypi_types::{Requirement, ResolverMarkerEnvironment, VerbatimParsedUrl};
 use uv_python::{Interpreter, PythonEnvironment};
 use uv_types::InstalledPackagesProvider;
 use uv_warnings::warn_user;
@@ -215,7 +215,7 @@ impl SitePackages {
 
                 // Determine the dependencies for the given package.
                 let Ok(metadata) = distribution.metadata() else {
-                    diagnostics.push(SitePackagesDiagnostic::IncompletePackage {
+                    diagnostics.push(SitePackagesDiagnostic::MetadataUnavailable {
                         package: package.clone(),
                         path: distribution.path().to_owned(),
                     });
@@ -250,10 +250,10 @@ impl SitePackages {
                         }
                         [installed] => {
                             match &dependency.version_or_url {
-                                None | Some(pep508_rs::VersionOrUrl::Url(_)) => {
+                                None | Some(uv_pep508::VersionOrUrl::Url(_)) => {
                                     // Nothing to do (accept any installed version).
                                 }
-                                Some(pep508_rs::VersionOrUrl::VersionSpecifier(
+                                Some(uv_pep508::VersionOrUrl::VersionSpecifier(
                                     version_specifier,
                                 )) => {
                                     // The installed version doesn't satisfy the requirement.
@@ -405,7 +405,7 @@ impl IntoIterator for SitePackages {
 
 #[derive(Debug)]
 pub enum SitePackagesDiagnostic {
-    IncompletePackage {
+    MetadataUnavailable {
         /// The package that is missing metadata.
         package: PackageName,
         /// The path to the package.
@@ -423,7 +423,7 @@ pub enum SitePackagesDiagnostic {
         /// The package that is missing a dependency.
         package: PackageName,
         /// The dependency that is missing.
-        requirement: pep508_rs::Requirement<VerbatimParsedUrl>,
+        requirement: uv_pep508::Requirement<VerbatimParsedUrl>,
     },
     IncompatibleDependency {
         /// The package that has an incompatible dependency.
@@ -431,7 +431,7 @@ pub enum SitePackagesDiagnostic {
         /// The version of the package that is installed.
         version: Version,
         /// The dependency that is incompatible.
-        requirement: pep508_rs::Requirement<VerbatimParsedUrl>,
+        requirement: uv_pep508::Requirement<VerbatimParsedUrl>,
     },
     DuplicatePackage {
         /// The package that has multiple installed distributions.
@@ -445,7 +445,7 @@ impl Diagnostic for SitePackagesDiagnostic {
     /// Convert the diagnostic into a user-facing message.
     fn message(&self) -> String {
         match self {
-            Self::IncompletePackage { package, path } => format!(
+            Self::MetadataUnavailable { package, path } => format!(
                 "The package `{package}` is broken or incomplete (unable to read `METADATA`). Consider recreating the virtualenv, or removing the package directory at: {}.", path.display(),
             ),
             Self::IncompatiblePythonVersion {
@@ -482,7 +482,7 @@ impl Diagnostic for SitePackagesDiagnostic {
     /// Returns `true` if the [`PackageName`] is involved in this diagnostic.
     fn includes(&self, name: &PackageName) -> bool {
         match self {
-            Self::IncompletePackage { package, .. } => name == package,
+            Self::MetadataUnavailable { package, .. } => name == package,
             Self::IncompatiblePythonVersion { package, .. } => name == package,
             Self::MissingDependency { package, .. } => name == package,
             Self::IncompatibleDependency {

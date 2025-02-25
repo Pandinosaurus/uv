@@ -1,16 +1,19 @@
 use std::path::PathBuf;
 
+use owo_colors::OwoColorize;
 use tokio::task::JoinError;
 use url::Url;
 use zip::result::ZipError;
 
 use crate::metadata::MetadataError;
-use distribution_filename::WheelFilenameError;
-use pep440_rs::Version;
-use pypi_types::{HashDigest, ParsedUrlError};
 use uv_client::WrappedReqwestError;
+use uv_distribution_filename::WheelFilenameError;
+use uv_distribution_types::{InstalledDist, InstalledDistError, IsBuildBackendError};
 use uv_fs::Simplified;
 use uv_normalize::PackageName;
+use uv_pep440::{Version, VersionSpecifiers};
+use uv_pypi_types::{HashAlgorithm, HashDigest};
+use uv_types::AnyErrorBuild;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -18,14 +21,12 @@ pub enum Error {
     NoBuild,
 
     // Network error
-    #[error("Failed to parse URL: {0}")]
-    Url(String, #[source] url::ParseError),
     #[error("Expected an absolute path, but received: {}", _0.user_display())]
     RelativePath(PathBuf),
     #[error(transparent)]
-    ParsedUrl(#[from] ParsedUrlError),
+    InvalidUrl(#[from] uv_distribution_types::ToUrlError),
     #[error(transparent)]
-    JoinRelativeUrl(#[from] pypi_types::JoinRelativeError),
+    JoinRelativeUrl(#[from] uv_pypi_types::JoinRelativeError),
     #[error("Expected a file URL, but received: {0}")]
     NonFileUrl(Url),
     #[error(transparent)]
@@ -51,48 +52,62 @@ pub enum Error {
 
     // Build error
     #[error(transparent)]
-    Build(anyhow::Error),
-    #[error("Failed to build editable: `{0}`")]
-    BuildEditable(String, #[source] anyhow::Error),
+    Build(AnyErrorBuild),
     #[error("Built wheel has an invalid filename")]
     WheelFilename(#[from] WheelFilenameError),
     #[error("Package metadata name `{metadata}` does not match given name `{given}`")]
-    NameMismatch {
+    WheelMetadataNameMismatch {
         given: PackageName,
         metadata: PackageName,
     },
     #[error("Package metadata version `{metadata}` does not match given version `{given}`")]
-    VersionMismatch { given: Version, metadata: Version },
+    WheelMetadataVersionMismatch { given: Version, metadata: Version },
+    #[error(
+        "Package metadata name `{metadata}` does not match `{filename}` from the wheel filename"
+    )]
+    WheelFilenameNameMismatch {
+        filename: PackageName,
+        metadata: PackageName,
+    },
+    #[error(
+        "Package metadata version `{metadata}` does not match `{filename}` from the wheel filename"
+    )]
+    WheelFilenameVersionMismatch {
+        filename: Version,
+        metadata: Version,
+    },
     #[error("Failed to parse metadata from built wheel")]
-    Metadata(#[from] pypi_types::MetadataError),
+    Metadata(#[from] uv_pypi_types::MetadataError),
     #[error("Failed to read metadata: `{}`", _0.user_display())]
     WheelMetadata(PathBuf, #[source] Box<uv_metadata::Error>),
+    #[error("Failed to read metadata from installed package `{0}`")]
+    ReadInstalled(Box<InstalledDist>, #[source] InstalledDistError),
     #[error("Failed to read zip archive from built wheel")]
     Zip(#[from] ZipError),
-    #[error("Source distribution directory contains neither readable `pyproject.toml` nor `setup.py`: `{}`", _0.user_display())]
-    DirWithoutEntrypoint(PathBuf),
     #[error("Failed to extract archive")]
     Extract(#[from] uv_extract::Error),
     #[error("The source distribution is missing a `PKG-INFO` file")]
     MissingPkgInfo,
-    #[error("The source distribution is missing an `egg-info` directory")]
-    MissingEggInfo,
-    #[error("The source distribution is missing a `requires.txt` file")]
-    MissingRequiresTxt,
+    #[error("The source distribution `{}` has no subdirectory `{}`", _0, _1.display())]
+    MissingSubdirectory(Url, PathBuf),
     #[error("Failed to extract static metadata from `PKG-INFO`")]
-    PkgInfo(#[source] pypi_types::MetadataError),
+    PkgInfo(#[source] uv_pypi_types::MetadataError),
     #[error("Failed to extract metadata from `requires.txt`")]
-    RequiresTxt(#[source] pypi_types::MetadataError),
+    RequiresTxt(#[source] uv_pypi_types::MetadataError),
     #[error("The source distribution is missing a `pyproject.toml` file")]
     MissingPyprojectToml,
     #[error("Failed to extract static metadata from `pyproject.toml`")]
-    PyprojectToml(#[source] pypi_types::MetadataError),
+    PyprojectToml(#[source] uv_pypi_types::MetadataError),
     #[error("Unsupported scheme in URL: {0}")]
     UnsupportedScheme(String),
     #[error(transparent)]
     MetadataLowering(#[from] MetadataError),
     #[error("Distribution not found at: {0}")]
     NotFound(Url),
+    #[error("Attempted to re-extract the source distribution for `{}`, but the {} hash didn't match. Run `{}` to clear the cache.", _0, _1, "uv cache clean".green())]
+    CacheHeal(String, HashAlgorithm),
+    #[error("The source distribution requires Python {0}, but {1} is installed")]
+    RequiresPython(VersionSpecifiers, Version),
 
     /// A generic request middleware error happened while making a request.
     /// Refer to the error message for more details.
@@ -151,6 +166,15 @@ impl From<reqwest_middleware::Error> for Error {
             reqwest_middleware::Error::Reqwest(error) => {
                 Self::Reqwest(WrappedReqwestError::from(error))
             }
+        }
+    }
+}
+
+impl IsBuildBackendError for Error {
+    fn is_build_backend_error(&self) -> bool {
+        match self {
+            Self::Build(err) => err.is_build_backend_error(),
+            _ => false,
         }
     }
 }

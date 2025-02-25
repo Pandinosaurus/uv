@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use pep508_rs::PackageName;
+use uv_pep508::PackageName;
 
 /// A specifier used for (e.g.) pip's `--no-binary` flag.
 ///
@@ -31,7 +31,7 @@ impl<'de> serde::Deserialize<'de> for PackageNameSpecifier {
     {
         struct Visitor;
 
-        impl<'de> serde::de::Visitor<'de> for Visitor {
+        impl serde::de::Visitor<'_> for Visitor {
             type Value = PackageNameSpecifier;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {

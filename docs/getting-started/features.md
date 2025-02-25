@@ -3,7 +3,7 @@
 uv provides essential features for Python development — from installing Python and hacking on simple
 scripts to working on large projects that support multiple Python versions and platforms.
 
-uv's interface can be broken down into sections, which can be used independently or together.
+uv's interface can be broken down into sections, which are usable independently or together.
 
 ## Python versions
 
@@ -38,6 +38,8 @@ Creating and working on Python projects, i.e., with a `pyproject.toml`.
 - `uv lock`: Create a lockfile for the project's dependencies.
 - `uv run`: Run a command in the project environment.
 - `uv tree`: View the dependency tree for the project.
+- `uv build`: Build the project into distribution archives.
+- `uv publish`: Publish the project to a package index.
 
 See the [guide on projects](../guides/projects.md) to get started.
 

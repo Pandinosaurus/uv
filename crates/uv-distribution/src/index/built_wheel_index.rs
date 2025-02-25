@@ -1,15 +1,16 @@
+use uv_cache::{Cache, CacheBucket, CacheShard, WheelCache};
+use uv_cache_info::CacheInfo;
+use uv_cache_key::cache_digest;
+use uv_configuration::ConfigSettings;
+use uv_distribution_types::{
+    DirectUrlSourceDist, DirectorySourceDist, GitSourceDist, Hashed, PathSourceDist,
+};
+use uv_platform_tags::Tags;
+use uv_types::HashStrategy;
+
 use crate::index::cached_wheel::CachedWheel;
 use crate::source::{HttpRevisionPointer, LocalRevisionPointer, HTTP_REVISION, LOCAL_REVISION};
 use crate::Error;
-use distribution_types::{
-    DirectUrlSourceDist, DirectorySourceDist, GitSourceDist, Hashed, PathSourceDist,
-};
-use platform_tags::Tags;
-use uv_cache::{Cache, CacheBucket, CacheShard, WheelCache};
-use uv_cache_info::CacheInfo;
-use uv_configuration::ConfigSettings;
-use uv_fs::symlinks;
-use uv_types::HashStrategy;
 
 /// A local index of built distributions for a specific source distribution.
 #[derive(Debug)]
@@ -65,7 +66,7 @@ impl<'a> BuiltWheelIndex<'a> {
         let cache_shard = if self.build_configuration.is_empty() {
             cache_shard
         } else {
-            cache_shard.shard(cache_key::cache_digest(self.build_configuration))
+            cache_shard.shard(cache_digest(self.build_configuration))
         };
 
         Ok(self.find(&cache_shard))
@@ -102,7 +103,7 @@ impl<'a> BuiltWheelIndex<'a> {
         let cache_shard = if self.build_configuration.is_empty() {
             cache_shard
         } else {
-            cache_shard.shard(cache_key::cache_digest(self.build_configuration))
+            cache_shard.shard(cache_digest(self.build_configuration))
         };
 
         Ok(self
@@ -150,7 +151,7 @@ impl<'a> BuiltWheelIndex<'a> {
         let cache_shard = if self.build_configuration.is_empty() {
             cache_shard
         } else {
-            cache_shard.shard(cache_key::cache_digest(self.build_configuration))
+            cache_shard.shard(cache_digest(self.build_configuration))
         };
 
         Ok(self
@@ -169,14 +170,14 @@ impl<'a> BuiltWheelIndex<'a> {
 
         let cache_shard = self.cache.shard(
             CacheBucket::SourceDistributions,
-            WheelCache::Git(&source_dist.url, &git_sha.to_short_string()).root(),
+            WheelCache::Git(&source_dist.url, git_sha.as_short_str()).root(),
         );
 
         // If there are build settings, we need to scope to a cache shard.
         let cache_shard = if self.build_configuration.is_empty() {
             cache_shard
         } else {
-            cache_shard.shard(cache_key::cache_digest(self.build_configuration))
+            cache_shard.shard(cache_digest(self.build_configuration))
         };
 
         self.find(&cache_shard)
@@ -202,8 +203,16 @@ impl<'a> BuiltWheelIndex<'a> {
         let mut candidate: Option<CachedWheel> = None;
 
         // Unzipped wheels are stored as symlinks into the archive directory.
-        for subdir in symlinks(shard) {
-            match CachedWheel::from_built_source(&subdir) {
+        for wheel_dir in uv_fs::entries(shard) {
+            // Ignore any `.lock` files.
+            if wheel_dir
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("lock"))
+            {
+                continue;
+            }
+
+            match CachedWheel::from_built_source(&wheel_dir, self.cache) {
                 None => {}
                 Some(dist_info) => {
                     // Pick the wheel with the highest priority

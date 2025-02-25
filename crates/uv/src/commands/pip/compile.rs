@@ -1,30 +1,32 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::path::Path;
+use std::str::FromStr;
+use std::sync::Arc;
 
-use anstream::eprint;
 use anyhow::{anyhow, Result};
 use itertools::Itertools;
 use owo_colors::OwoColorize;
+use rustc_hash::FxHashSet;
 use tracing::debug;
 
-use distribution_types::{
-    DependencyMetadata, IndexCapabilities, IndexLocations, NameRequirementSpecification,
-    UnresolvedRequirementSpecification, Verbatim,
-};
-use install_wheel_rs::linker::LinkMode;
-use pypi_types::{Requirement, SupportedEnvironments};
-use uv_auth::store_credentials_from_url;
 use uv_cache::Cache;
 use uv_client::{BaseClientBuilder, Connectivity, FlatIndexClient, RegistryClientBuilder};
 use uv_configuration::{
-    BuildOptions, Concurrency, ConfigSettings, Constraints, ExtrasSpecification, IndexStrategy,
-    NoBinary, NoBuild, Reinstall, SourceStrategy, TrustedHost, Upgrade,
+    BuildOptions, Concurrency, ConfigSettings, Constraints, DevGroupsSpecification,
+    ExtrasSpecification, IndexStrategy, NoBinary, NoBuild, PreviewMode, Reinstall, SourceStrategy,
+    TrustedHost, Upgrade,
 };
 use uv_configuration::{KeyringProviderType, TargetTriple};
-use uv_dispatch::BuildDispatch;
+use uv_dispatch::{BuildDispatch, SharedState};
+use uv_distribution_types::{
+    DependencyMetadata, HashGeneration, Index, IndexLocations, NameRequirementSpecification,
+    Origin, UnresolvedRequirementSpecification, Verbatim,
+};
 use uv_fs::Simplified;
-use uv_git::GitResolver;
+use uv_install_wheel::LinkMode;
 use uv_normalize::PackageName;
+use uv_pypi_types::{Conflicts, Requirement, SupportedEnvironments};
 use uv_python::{
     EnvironmentPreference, PythonEnvironment, PythonInstallation, PythonPreference, PythonRequest,
     PythonVersion, VersionRequest,
@@ -33,16 +35,16 @@ use uv_requirements::{
     upgrade::read_requirements_txt, RequirementsSource, RequirementsSpecification,
 };
 use uv_resolver::{
-    AnnotationStyle, DependencyMode, DisplayResolutionGraph, ExcludeNewer, FlatIndex,
+    AnnotationStyle, DependencyMode, DisplayResolutionGraph, ExcludeNewer, FlatIndex, ForkStrategy,
     InMemoryIndex, OptionsBuilder, PrereleaseMode, PythonRequirement, RequiresPython,
-    ResolutionMode, ResolverMarkers,
+    ResolutionMode, ResolverEnvironment,
 };
-use uv_types::{BuildIsolation, EmptyInstalledPackages, HashStrategy, InFlight};
+use uv_types::{BuildIsolation, EmptyInstalledPackages, HashStrategy};
 use uv_warnings::warn_user;
 
 use crate::commands::pip::loggers::DefaultResolveLogger;
 use crate::commands::pip::{operations, resolution_environment};
-use crate::commands::{ExitStatus, OutputWriter};
+use crate::commands::{diagnostics, ExitStatus, OutputWriter};
 use crate::printer::Printer;
 
 /// Resolve a set of requirements into a set of pinned versions.
@@ -54,11 +56,14 @@ pub(crate) async fn pip_compile(
     build_constraints: &[RequirementsSource],
     constraints_from_workspace: Vec<Requirement>,
     overrides_from_workspace: Vec<Requirement>,
+    build_constraints_from_workspace: Vec<Requirement>,
     environments: SupportedEnvironments,
     extras: ExtrasSpecification,
+    groups: DevGroupsSpecification,
     output_file: Option<&Path>,
     resolution_mode: ResolutionMode,
     prerelease_mode: PrereleaseMode,
+    fork_strategy: ForkStrategy,
     dependency_mode: DependencyMode,
     upgrade: Upgrade,
     generate_hashes: bool,
@@ -77,20 +82,20 @@ pub(crate) async fn pip_compile(
     index_strategy: IndexStrategy,
     dependency_metadata: DependencyMetadata,
     keyring_provider: KeyringProviderType,
-    allow_insecure_host: Vec<TrustedHost>,
+    allow_insecure_host: &[TrustedHost],
     config_settings: ConfigSettings,
     connectivity: Connectivity,
     no_build_isolation: bool,
     no_build_isolation_package: Vec<PackageName>,
     build_options: BuildOptions,
-    python_version: Option<PythonVersion>,
+    mut python_version: Option<PythonVersion>,
     python_platform: Option<TargetTriple>,
     universal: bool,
     exclude_newer: Option<ExcludeNewer>,
     sources: SourceStrategy,
     annotation_style: AnnotationStyle,
     link_mode: LinkMode,
-    python: Option<String>,
+    mut python: Option<String>,
     system: bool,
     python_preference: PythonPreference,
     concurrency: Concurrency,
@@ -98,7 +103,31 @@ pub(crate) async fn pip_compile(
     quiet: bool,
     cache: Cache,
     printer: Printer,
+    preview: PreviewMode,
 ) -> Result<ExitStatus> {
+    // Respect `UV_PYTHON`
+    if python.is_none() && python_version.is_none() {
+        if let Ok(request) = std::env::var("UV_PYTHON") {
+            if !request.is_empty() {
+                python = Some(request);
+            }
+        }
+    }
+
+    // If `--python` / `-p` is a simple Python version request, we treat it as `--python-version`
+    // for backwards compatibility. `-p` was previously aliased to `--python-version` but changed to
+    // `--python` for consistency with the rest of the CLI in v0.6.0. Since we assume metadata is
+    // consistent across wheels, it's okay for us to build wheels (to determine metadata) with an
+    // alternative Python interpreter as long as we solve with the proper Python version tags.
+    if python_version.is_none() {
+        if let Some(request) = python.as_ref() {
+            if let Ok(version) = PythonVersion::from_str(request) {
+                python_version = Some(version);
+                python = None;
+            }
+        }
+    }
+
     // If the user requests `extras` but does not provide a valid source (e.g., a `pyproject.toml`),
     // return an error.
     if !extras.is_empty() && !requirements.iter().any(RequirementsSource::allows_extras) {
@@ -111,7 +140,7 @@ pub(crate) async fn pip_compile(
         .connectivity(connectivity)
         .native_tls(native_tls)
         .keyring(keyring_provider)
-        .allow_insecure_host(allow_insecure_host);
+        .allow_insecure_host(allow_insecure_host.to_vec());
 
     // Read all requirements from the provided sources.
     let RequirementsSpecification {
@@ -156,8 +185,17 @@ pub(crate) async fn pip_compile(
         .collect();
 
     // Read build constraints.
-    let build_constraints =
-        operations::read_constraints(build_constraints, &client_builder).await?;
+    let build_constraints: Vec<NameRequirementSpecification> =
+        operations::read_constraints(build_constraints, &client_builder)
+            .await?
+            .iter()
+            .cloned()
+            .chain(
+                build_constraints_from_workspace
+                    .into_iter()
+                    .map(NameRequirementSpecification::from),
+            )
+            .collect();
 
     // If all the metadata could be statically resolved, validate that every extra was used. If we
     // need to resolve metadata via PEP 517, we don't know which extras are used until much later.
@@ -185,8 +223,8 @@ pub(crate) async fn pip_compile(
         let request = PythonRequest::parse(python);
         PythonInstallation::find(&request, environment_preference, python_preference, &cache)
     } else {
-        // TODO(zanieb): The split here hints at a problem with the abstraction; we should be able to use
-        // `PythonInstallation::find(...)` here.
+        // TODO(zanieb): The split here hints at a problem with the request abstraction; we should
+        // be able to use `PythonInstallation::find(...)` here.
         let request = if let Some(version) = python_version.as_ref() {
             // TODO(zanieb): We should consolidate `VersionRequest` and `PythonVersion`
             PythonRequest::Version(VersionRequest::from(version))
@@ -212,6 +250,7 @@ pub(crate) async fn pip_compile(
                 && python_version.minor() == interpreter.python_minor()
         };
         if no_build.is_none()
+            && python.is_none()
             && python_version.version() != interpreter.python_version()
             && (python_version.patch().is_some() || !matches_without_patch)
         {
@@ -223,8 +262,8 @@ pub(crate) async fn pip_compile(
         }
     }
 
-    // Create a shared in-memory index.
-    let source_index = InMemoryIndex::default();
+    // Create the shared state.
+    let state = SharedState::default();
 
     // If we're resolving against a different Python version, use a separate index. Source
     // distributions will be built against the installed version, and so the index may contain
@@ -232,7 +271,7 @@ pub(crate) async fn pip_compile(
     let top_level_index = if python_version.is_some() {
         InMemoryIndex::default()
     } else {
-        source_index.clone()
+        state.index().clone()
     };
 
     // Determine the Python requirement, if the user requested a specific version.
@@ -252,34 +291,49 @@ pub(crate) async fn pip_compile(
     };
 
     // Determine the environment for the resolution.
-    let (tags, markers) = if universal {
+    let (tags, resolver_env) = if universal {
         (
             None,
-            ResolverMarkers::universal(environments.into_markers()),
+            ResolverEnvironment::universal(environments.into_markers()),
         )
     } else {
-        let (tags, markers) =
+        let (tags, marker_env) =
             resolution_environment(python_version, python_platform, &interpreter)?;
-        (Some(tags), ResolverMarkers::specific_environment(markers))
+        (Some(tags), ResolverEnvironment::specific(marker_env))
     };
 
     // Generate, but don't enforce hashes for the requirements.
     let hasher = if generate_hashes {
-        HashStrategy::Generate
+        HashStrategy::Generate(HashGeneration::All)
     } else {
         HashStrategy::None
     };
 
-    // Ignore development dependencies.
-    let dev = Vec::default();
-
     // Incorporate any index locations from the provided sources.
-    let index_locations =
-        index_locations.combine(index_url, extra_index_urls, find_links, no_index);
+    let index_locations = index_locations.combine(
+        extra_index_urls
+            .into_iter()
+            .map(Index::from_extra_index_url)
+            .chain(index_url.map(Index::from_index_url))
+            .map(|index| index.with_origin(Origin::RequirementsTxt))
+            .collect(),
+        find_links
+            .into_iter()
+            .map(Index::from_find_links)
+            .map(|index| index.with_origin(Origin::RequirementsTxt))
+            .collect(),
+        no_index,
+    );
 
     // Add all authenticated sources to the cache.
-    for url in index_locations.urls() {
-        store_credentials_from_url(url);
+    for index in index_locations.allowed_indexes() {
+        if let Some(credentials) = index.credentials() {
+            let credentials = Arc::new(credentials);
+            uv_auth::store_credentials(index.raw_url(), credentials.clone());
+            if let Some(root_url) = index.root_url() {
+                uv_auth::store_credentials(&root_url, credentials.clone());
+            }
+        }
     }
 
     // Initialize the registry client.
@@ -293,8 +347,6 @@ pub(crate) async fn pip_compile(
 
     // Read the lockfile, if present.
     let preferences = read_requirements_txt(output_file, &upgrade).await?;
-    let git = GitResolver::default();
-    let capabilities = IndexCapabilities::default();
 
     // Combine the `--no-binary` and `--no-build` flags from the requirements files.
     let build_options = build_options.combine(no_binary, no_build);
@@ -302,12 +354,11 @@ pub(crate) async fn pip_compile(
     // Resolve the flat indexes from `--find-links`.
     let flat_index = {
         let client = FlatIndexClient::new(&client, &cache);
-        let entries = client.fetch(index_locations.flat_index()).await?;
+        let entries = client
+            .fetch(index_locations.flat_indexes().map(Index::url))
+            .await?;
         FlatIndex::from_entries(entries, tags.as_deref(), &hasher, &build_options)
     };
-
-    // Track in-flight downloads, builds, etc., across resolutions.
-    let in_flight = InFlight::default();
 
     // Determine whether to enable build isolation.
     let environment;
@@ -337,10 +388,7 @@ pub(crate) async fn pip_compile(
         &index_locations,
         &flat_index,
         &dependency_metadata,
-        &source_index,
-        &git,
-        &capabilities,
-        &in_flight,
+        state,
         index_strategy,
         &config_settings,
         build_isolation,
@@ -350,14 +398,17 @@ pub(crate) async fn pip_compile(
         exclude_newer,
         sources,
         concurrency,
+        preview,
     );
 
     let options = OptionsBuilder::new()
         .resolution_mode(resolution_mode)
         .prerelease_mode(prerelease_mode)
+        .fork_strategy(fork_strategy)
         .dependency_mode(dependency_mode)
         .exclude_newer(exclude_newer)
         .index_strategy(index_strategy)
+        .build_options(build_options.clone())
         .build();
 
     // Resolve the requirements.
@@ -365,19 +416,20 @@ pub(crate) async fn pip_compile(
         requirements,
         constraints,
         overrides,
-        dev,
         source_trees,
         project,
-        None,
+        BTreeSet::default(),
         &extras,
+        &groups,
         preferences,
         EmptyInstalledPackages,
         &hasher,
         &Reinstall::None,
         &upgrade,
         tags.as_deref(),
-        markers.clone(),
+        resolver_env.clone(),
         python_requirement,
+        Conflicts::empty(),
         &client,
         &flat_index,
         &top_level_index,
@@ -390,12 +442,11 @@ pub(crate) async fn pip_compile(
     .await
     {
         Ok(resolution) => resolution,
-        Err(operations::Error::Resolve(uv_resolver::ResolveError::NoSolution(err))) => {
-            let report = miette::Report::msg(format!("{err}")).context(err.header());
-            eprint!("{report:?}");
-            return Ok(ExitStatus::Failure);
+        Err(err) => {
+            return diagnostics::OperationDiagnostic::native_tls(native_tls)
+                .report(err)
+                .map_or(Ok(ExitStatus::Failure), |err| Err(err.into()))
         }
-        Err(err) => return Err(err.into()),
     };
 
     // Write the resolved dependencies to the output channel.
@@ -423,8 +474,8 @@ pub(crate) async fn pip_compile(
     }
 
     if include_marker_expression {
-        if let ResolverMarkers::SpecificEnvironment(markers) = &markers {
-            let relevant_markers = resolution.marker_tree(&top_level_index, markers)?;
+        if let Some(marker_env) = resolver_env.marker_environment() {
+            let relevant_markers = resolution.marker_tree(&top_level_index, marker_env)?;
             if let Some(relevant_markers) = relevant_markers.contents() {
                 writeln!(
                     writer,
@@ -440,20 +491,23 @@ pub(crate) async fn pip_compile(
 
     // If necessary, include the `--index-url` and `--extra-index-url` locations.
     if include_index_url {
-        if let Some(index) = index_locations.index() {
-            writeln!(writer, "--index-url {}", index.verbatim())?;
+        if let Some(index) = index_locations.default_index() {
+            writeln!(writer, "--index-url {}", index.url().verbatim())?;
             wrote_preamble = true;
         }
-        for extra_index in index_locations.extra_index() {
-            writeln!(writer, "--extra-index-url {}", extra_index.verbatim())?;
-            wrote_preamble = true;
+        let mut seen = FxHashSet::default();
+        for extra_index in index_locations.implicit_indexes() {
+            if seen.insert(extra_index.url()) {
+                writeln!(writer, "--extra-index-url {}", extra_index.url().verbatim())?;
+                wrote_preamble = true;
+            }
         }
     }
 
     // If necessary, include the `--find-links` locations.
     if include_find_links {
-        for flat_index in index_locations.flat_index() {
-            writeln!(writer, "--find-links {}", flat_index.verbatim())?;
+        for flat_index in index_locations.flat_indexes() {
+            writeln!(writer, "--find-links {}", flat_index.url().verbatim())?;
             wrote_preamble = true;
         }
     }
@@ -498,7 +552,7 @@ pub(crate) async fn pip_compile(
         "{}",
         DisplayResolutionGraph::new(
             &resolution,
-            &markers,
+            &resolver_env,
             &no_emit_packages,
             generate_hashes,
             include_extras,
@@ -557,14 +611,24 @@ fn cmd(
 
             // Skip any index URLs, unless requested.
             if !include_index_url {
-                if arg.starts_with("--extra-index-url=") || arg.starts_with("--index-url=") {
+                if arg.starts_with("--extra-index-url=")
+                    || arg.starts_with("--index-url=")
+                    || arg.starts_with("-i=")
+                    || arg.starts_with("--index=")
+                    || arg.starts_with("--default-index=")
+                {
                     // Reset state; skip this iteration.
                     *skip_next = None;
                     return Some(None);
                 }
 
                 // Mark the next item as (to be) skipped.
-                if arg == "--index-url" || arg == "--extra-index-url" {
+                if arg == "--index-url"
+                    || arg == "--extra-index-url"
+                    || arg == "-i"
+                    || arg == "--index"
+                    || arg == "--default-index"
+                {
                     *skip_next = Some(true);
                     return Some(None);
                 }
@@ -613,6 +677,18 @@ fn cmd(
 
             // Always skip the `--verbose` flag.
             if arg == "--verbose" || arg == "-v" {
+                *skip_next = None;
+                return Some(None);
+            }
+
+            // Always skip the `--no-progress` flag.
+            if arg == "--no-progress" {
+                *skip_next = None;
+                return Some(None);
+            }
+
+            // Always skip the `--native-tls` flag.
+            if arg == "--native-tls" {
                 *skip_next = None;
                 return Some(None);
             }

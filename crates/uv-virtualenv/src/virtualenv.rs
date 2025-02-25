@@ -10,9 +10,10 @@ use fs_err::File;
 use itertools::Itertools;
 use tracing::debug;
 
-use pypi_types::Scheme;
 use uv_fs::{cachedir, Simplified, CWD};
+use uv_pypi_types::Scheme;
 use uv_python::{Interpreter, VirtualEnvironment};
+use uv_shell::escape_posix_for_single_quotes;
 use uv_version::version;
 
 use crate::{Error, Prompt};
@@ -54,35 +55,20 @@ pub(crate) fn create(
     seed: bool,
 ) -> Result<VirtualEnvironment, Error> {
     // Determine the base Python executable; that is, the Python executable that should be
-    // considered the "base" for the virtual environment. This is typically the Python executable
-    // from the [`Interpreter`]; however, if the interpreter is a virtual environment itself, then
-    // the base Python executable is the Python executable of the interpreter's base interpreter.
-    let base_python = if cfg!(unix) {
-        // On Unix, follow symlinks to resolve the base interpreter, since the Python executable in
-        // a virtual environment is a symlink to the base interpreter.
-        uv_fs::canonicalize_executable(interpreter.sys_executable())?
-    } else if cfg!(windows) {
-        // On Windows, follow `virtualenv`. If we're in a virtual environment, use
-        // `sys._base_executable` if it exists; if not, use `sys.base_prefix`. For example, with
-        // Python installed from the Windows Store, `sys.base_prefix` is slightly "incorrect".
-        //
-        // If we're _not_ in a virtual environment, use the interpreter's executable, since it's
-        // already a "system Python". We canonicalize the path to ensure that it's real and
-        // consistent, though we don't expect any symlinks on Windows.
-        if interpreter.is_virtualenv() {
-            if let Some(base_executable) = interpreter.sys_base_executable() {
-                base_executable.to_path_buf()
-            } else {
-                // Assume `python.exe`, though the exact executable name is never used (below) on
-                // Windows, only its parent directory.
-                interpreter.sys_base_prefix().join("python.exe")
-            }
-        } else {
-            interpreter.sys_executable().to_path_buf()
-        }
+    // considered the "base" for the virtual environment.
+    //
+    // For consistency with the standard library, rely on `sys._base_executable`, _unless_ we're
+    // using a uv-managed Python (in which case, we can do better for symlinked executables).
+    let base_python = if cfg!(unix) && interpreter.is_standalone() {
+        interpreter.find_base_python()?
     } else {
-        unimplemented!("Only Windows and Unix are supported")
+        interpreter.to_base_python()?
     };
+
+    debug!(
+        "Using base executable for virtual environment: {}",
+        base_python.display()
+    );
 
     // Validate the existing location.
     match location.metadata() {
@@ -97,6 +83,18 @@ pub(crate) fn create(
                     debug!("Allowing existing directory");
                 } else if location.join("pyvenv.cfg").is_file() {
                     debug!("Removing existing directory");
+
+                    // On Windows, if the current executable is in the directory, guard against
+                    // self-deletion.
+                    #[cfg(windows)]
+                    if let Ok(itself) = std::env::current_exe() {
+                        let target = std::path::absolute(location)?;
+                        if itself.starts_with(&target) {
+                            debug!("Detected self-delete of executable: {}", itself.display());
+                            self_replace::self_delete_outside_path(location)?;
+                        }
+                    }
+
                     fs::remove_dir_all(location)?;
                     fs::create_dir_all(location)?;
                 } else if location
@@ -108,7 +106,7 @@ pub(crate) fn create(
                     return Err(Error::Io(io::Error::new(
                         io::ErrorKind::AlreadyExists,
                         format!(
-                            "The directory `{}` exists, but it's not a virtualenv",
+                            "The directory `{}` exists, but it's not a virtual environment",
                             location.user_display()
                         ),
                     )));
@@ -298,25 +296,20 @@ pub(crate) fn create(
 
         let virtual_env_dir = match (relocatable, name.to_owned()) {
             (true, "activate") => {
-                // Extremely verbose, but should cover all major POSIX shells,
-                // as well as platforms where `readlink` does not implement `-f`.
-                r#"'"$(dirname -- "$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" > /dev/null && echo "$PWD")")"'"#
+                r#"'"$(dirname -- "$(dirname -- "$(realpath -- "$SCRIPT_PATH")")")"'"#.to_string()
             }
-            (true, "activate.bat") => r"%~dp0..",
+            (true, "activate.bat") => r"%~dp0..".to_string(),
             (true, "activate.fish") => {
-                r#"'"$(dirname -- "$(cd "$(dirname -- "$(status -f)")"; and pwd)")"'"#
+                r#"'"$(dirname -- "$(cd "$(dirname -- "$(status -f)")"; and pwd)")"'"#.to_string()
             }
             // Note:
             // * relocatable activate scripts appear not to be possible in csh and nu shell
             // * `activate.ps1` is already relocatable by default.
-            _ => {
-                // SAFETY: `unwrap` is guaranteed to succeed because `location` is an `Utf8PathBuf`.
-                location.simplified().to_str().unwrap()
-            }
+            _ => escape_posix_for_single_quotes(location.simplified().to_str().unwrap()),
         };
 
         let activator = template
-            .replace("{{ VIRTUAL_ENV_DIR }}", virtual_env_dir)
+            .replace("{{ VIRTUAL_ENV_DIR }}", &virtual_env_dir)
             .replace("{{ BIN_NAME }}", bin_name)
             .replace(
                 "{{ VIRTUAL_PROMPT }}",
@@ -414,6 +407,7 @@ pub(crate) fn create(
         },
         root: location,
         executable,
+        base_executable: base_python,
     })
 }
 
@@ -481,19 +475,20 @@ impl WindowsExecutable {
     }
 
     /// The name of the launcher shim.
-    fn launcher(self) -> &'static str {
+    fn launcher(self, interpreter: &Interpreter) -> &'static str {
         match self {
-            WindowsExecutable::Python => "venvlauncher.exe",
-            WindowsExecutable::PythonMajor => "venvlauncher.exe",
-            WindowsExecutable::PythonMajorMinor => "venvlauncher.exe",
-            WindowsExecutable::Pythonw => "venvwlauncher.exe",
+            Self::Python | Self::PythonMajor | Self::PythonMajorMinor
+                if interpreter.gil_disabled() =>
+            {
+                "venvlaunchert.exe"
+            }
+            Self::Python | Self::PythonMajor | Self::PythonMajorMinor => "venvlauncher.exe",
+            Self::Pythonw if interpreter.gil_disabled() => "venvwlaunchert.exe",
+            Self::Pythonw => "venvwlauncher.exe",
             // From 3.13 on these should replace the `python.exe` and `pythonw.exe` shims.
             // These are not relevant as of now for PyPy as it doesn't yet support Python 3.13.
-            WindowsExecutable::PyPy => "venvlauncher.exe",
-            WindowsExecutable::PyPyMajor => "venvlauncher.exe",
-            WindowsExecutable::PyPyMajorMinor => "venvlauncher.exe",
-            WindowsExecutable::PyPyw => "venvwlauncher.exe",
-            WindowsExecutable::PyPyMajorMinorw => "venvwlauncher.exe",
+            Self::PyPy | Self::PyPyMajor | Self::PyPyMajorMinor => "venvlauncher.exe",
+            Self::PyPyw | Self::PyPyMajorMinorw => "venvwlauncher.exe",
             WindowsExecutable::GraalPy => "venvlauncher.exe",
         }
     }
@@ -534,7 +529,7 @@ fn copy_launcher_windows(
         .join("venv")
         .join("scripts")
         .join("nt")
-        .join(executable.launcher());
+        .join(executable.launcher(interpreter));
     match fs_err::copy(shim, scripts.join(executable.exe(interpreter))) {
         Ok(_) => return Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -545,7 +540,7 @@ fn copy_launcher_windows(
 
     // Third priority: on Conda at least, we can look for the launcher shim next to
     // the Python executable itself.
-    let shim = base_python.with_file_name(executable.launcher());
+    let shim = base_python.with_file_name(executable.launcher(interpreter));
     match fs_err::copy(shim, scripts.join(executable.exe(interpreter))) {
         Ok(_) => return Ok(()),
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}

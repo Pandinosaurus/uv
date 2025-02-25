@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use crate::Error;
-use distribution_filename::WheelFilename;
-use distribution_types::{CachedDist, Dist, Hashed};
-use pypi_types::{HashDigest, Metadata23};
+use uv_distribution_filename::WheelFilename;
+use uv_distribution_types::{CachedDist, Dist, Hashed};
 use uv_metadata::read_flat_wheel_metadata;
+use uv_pypi_types::{HashDigest, HashDigests, ResolutionMetadata};
 
 use uv_cache_info::CacheInfo;
 
@@ -21,7 +21,7 @@ pub struct LocalWheel {
     /// The cache index of the wheel.
     pub(crate) cache: CacheInfo,
     /// The computed hashes of the wheel.
-    pub(crate) hashes: Vec<HashDigest>,
+    pub(crate) hashes: HashDigests,
 }
 
 impl LocalWheel {
@@ -40,8 +40,8 @@ impl LocalWheel {
         &self.filename
     }
 
-    /// Read the [`Metadata23`] from a wheel.
-    pub fn metadata(&self) -> Result<Metadata23, Error> {
+    /// Read the [`ResolutionMetadata`] from a wheel.
+    pub fn metadata(&self) -> Result<ResolutionMetadata, Error> {
         read_flat_wheel_metadata(&self.filename, &self.archive)
             .map_err(|err| Error::WheelMetadata(self.archive.clone(), Box::new(err)))
     }
@@ -49,7 +49,7 @@ impl LocalWheel {
 
 impl Hashed for LocalWheel {
     fn hashes(&self) -> &[HashDigest] {
-        &self.hashes
+        self.hashes.as_slice()
     }
 }
 

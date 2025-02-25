@@ -1,8 +1,8 @@
 use url::Url;
 
-use pep508_rs::VerbatimUrl;
-use pypi_types::{ParsedGitUrl, ParsedUrl, VerbatimParsedUrl};
-use uv_git::{GitReference, GitResolver};
+use uv_git::GitResolver;
+use uv_pep508::VerbatimUrl;
+use uv_pypi_types::{ParsedGitUrl, ParsedUrl, VerbatimParsedUrl};
 
 /// Map a URL to a precise URL, if possible.
 pub(crate) fn url_to_precise(url: VerbatimParsedUrl, git: &GitResolver) -> VerbatimParsedUrl {
@@ -15,13 +15,11 @@ pub(crate) fn url_to_precise(url: VerbatimParsedUrl, git: &GitResolver) -> Verba
     };
 
     let Some(new_git_url) = git.precise(git_url.clone()) else {
-        debug_assert!(
-            matches!(git_url.reference(), GitReference::FullCommit(_)),
-            "Unseen Git URL: {}, {:?}",
-            url.verbatim,
-            git_url
-        );
-        return url;
+        if cfg!(debug_assertions) {
+            panic!("Unresolved Git URL: {}, {git_url:?}", url.verbatim);
+        } else {
+            return url;
+        }
     };
 
     let new_parsed_url = ParsedGitUrl {
@@ -89,7 +87,7 @@ fn apply_redirect(url: &VerbatimUrl, redirect: Url) -> VerbatimUrl {
 mod tests {
     use url::Url;
 
-    use pep508_rs::VerbatimUrl;
+    use uv_pep508::VerbatimUrl;
 
     use crate::redirect::apply_redirect;
 
@@ -124,7 +122,7 @@ mod tests {
 
         // If there's a conflict after the `@`, discard the original representation.
         let verbatim = VerbatimUrl::parse_url("https://github.com/flask.git@main")?
-            .with_given("git+https://github.com/flask.git@${TAG}".to_string());
+            .with_given("git+https://github.com/flask.git@${TAG}");
         let redirect =
             Url::parse("https://github.com/flask.git@b90a4f1f4a370e92054b9cc9db0efcb864f87ebe")?;
 
@@ -136,8 +134,9 @@ mod tests {
         // We should preserve subdirectory fragments.
         let verbatim = VerbatimUrl::parse_url("https://github.com/flask.git#subdirectory=src")?
             .with_given("git+https://github.com/flask.git#subdirectory=src");
-        let redirect =
-            Url::parse("https://github.com/flask.git@b90a4f1f4a370e92054b9cc9db0efcb864f87ebe#subdirectory=src")?;
+        let redirect = Url::parse(
+            "https://github.com/flask.git@b90a4f1f4a370e92054b9cc9db0efcb864f87ebe#subdirectory=src",
+        )?;
 
         let expected = VerbatimUrl::parse_url(
             "https://github.com/flask.git@b90a4f1f4a370e92054b9cc9db0efcb864f87ebe#subdirectory=src",

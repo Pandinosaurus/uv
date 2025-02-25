@@ -1,20 +1,25 @@
 //! Resolve the current [`ProjectWorkspace`] or [`Workspace`].
 
-use either::Either;
-use glob::{glob, GlobError, PatternError};
-use rustc_hash::FxHashSet;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use tracing::{debug, trace, warn};
 
-use pep508_rs::{MarkerTree, RequirementOrigin, VerbatimUrl};
-use pypi_types::{Requirement, RequirementSource, SupportedEnvironments, VerbatimParsedUrl};
+use glob::{glob, GlobError, PatternError};
+use rustc_hash::FxHashSet;
+use tracing::{debug, trace, warn};
+use uv_distribution_types::Index;
 use uv_fs::{Simplified, CWD};
 use uv_normalize::{GroupName, PackageName, DEV_DEPENDENCIES};
-use uv_warnings::{warn_user, warn_user_once};
+use uv_pep440::VersionSpecifiers;
+use uv_pep508::{MarkerTree, VerbatimUrl};
+use uv_pypi_types::{
+    Conflicts, Requirement, RequirementSource, SupportedEnvironments, VerbatimParsedUrl,
+};
+use uv_static::EnvVars;
+use uv_warnings::warn_user_once;
 
+use crate::dependency_groups::{DependencyGroupError, FlatDependencyGroups};
 use crate::pyproject::{
-    Project, PyProjectToml, PyprojectTomlError, Source, ToolUvSources, ToolUvWorkspace,
+    Project, PyProjectToml, PyprojectTomlError, Sources, ToolUvSources, ToolUvWorkspace,
 };
 
 #[derive(thiserror::Error, Debug)]
@@ -22,7 +27,7 @@ pub enum WorkspaceError {
     // Workspace structure errors.
     #[error("No `pyproject.toml` found in current directory or any parent directory")]
     MissingPyprojectToml,
-    #[error("Workspace member `{}` is missing a `pyproject.toml` (matches: `{1}`)", _0.simplified_display())]
+    #[error("Workspace member `{}` is missing a `pyproject.toml` (matches: `{}`)", _0.simplified_display(), _1)]
     MissingPyprojectTomlMember(PathBuf, String),
     #[error("No `project` table found in: `{}`", _0.simplified_display())]
     MissingProject(PathBuf),
@@ -30,13 +35,21 @@ pub enum WorkspaceError {
     MissingWorkspace(PathBuf),
     #[error("The project is marked as unmanaged: `{}`", _0.simplified_display())]
     NonWorkspace(PathBuf),
+    #[error("Nested workspaces are not supported, but workspace member (`{}`) has a `uv.workspace` table", _0.simplified_display())]
+    NestedWorkspace(PathBuf),
+    #[error("Two workspace members are both named: `{name}`: `{}` and `{}`", first.simplified_display(), second.simplified_display())]
+    DuplicatePackage {
+        name: PackageName,
+        first: PathBuf,
+        second: PathBuf,
+    },
     #[error("pyproject.toml section is declared as dynamic, but must be static: `{0}`")]
     DynamicNotAllowed(&'static str),
     #[error("Failed to find directories for glob: `{0}`")]
     Pattern(String, #[source] PatternError),
     // Syntax and other errors.
-    #[error("Invalid glob in `tool.uv.workspace.members`: `{0}`")]
-    Glob(String, #[source] GlobError),
+    #[error("Directory walking failed for `tool.uv.workspace.members` glob: `{0}`")]
+    GlobWalk(String, #[source] GlobError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("Failed to parse: `{}`", _0.user_display())]
@@ -78,7 +91,11 @@ pub struct Workspace {
     /// The sources table from the workspace `pyproject.toml`.
     ///
     /// This table is overridden by the project sources.
-    sources: BTreeMap<PackageName, Source>,
+    sources: BTreeMap<PackageName, Sources>,
+    /// The index table from the workspace `pyproject.toml`.
+    ///
+    /// This table is overridden by the project indexes.
+    indexes: Vec<Index>,
     /// The `pyproject.toml` of the workspace root.
     pyproject_toml: PyProjectToml,
 }
@@ -177,8 +194,6 @@ impl Workspace {
             workspace_root.simplified_display()
         );
 
-        check_nested_workspaces(&workspace_root, options);
-
         // Unlike in `ProjectWorkspace` discovery, we might be in a legacy non-project root without
         // being in any specific project.
         let current_project = pyproject_toml
@@ -263,36 +278,16 @@ impl Workspace {
             .any(|member| *member.root() == self.install_path)
     }
 
-    /// Returns the set of requirements that include all packages in the workspace.
+    /// Returns the set of all workspace members.
     pub fn members_requirements(&self) -> impl Iterator<Item = Requirement> + '_ {
         self.packages.values().filter_map(|member| {
-            let project = member.pyproject_toml.project.as_ref()?;
-            // Extract the extras available in the project.
-            let extras = project
-                .optional_dependencies
-                .as_ref()
-                .map(|optional_dependencies| {
-                    // It's a `BTreeMap` so the keys are sorted.
-                    optional_dependencies
-                        .iter()
-                        .filter_map(|(name, dependencies)| {
-                            if dependencies.is_empty() {
-                                None
-                            } else {
-                                Some(name)
-                            }
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-
             let url = VerbatimUrl::from_absolute_path(&member.root)
                 .expect("path is valid URL")
                 .with_given(member.root.to_string_lossy());
             Some(Requirement {
-                name: project.name.clone(),
-                extras,
+                name: member.pyproject_toml.project.as_ref()?.name.clone(),
+                extras: vec![],
+                groups: vec![],
                 marker: MarkerTree::TRUE,
                 source: if member.pyproject_toml.is_package() {
                     RequirementSource::Directory {
@@ -314,14 +309,122 @@ impl Workspace {
         })
     }
 
+    /// Returns the set of all workspace member dependency groups.
+    pub fn group_requirements(&self) -> impl Iterator<Item = Requirement> + '_ {
+        self.packages.values().filter_map(|member| {
+            let url = VerbatimUrl::from_absolute_path(&member.root)
+                .expect("path is valid URL")
+                .with_given(member.root.to_string_lossy());
+
+            let groups = {
+                let mut groups = member
+                    .pyproject_toml
+                    .dependency_groups
+                    .as_ref()
+                    .map(|groups| groups.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                if member
+                    .pyproject_toml
+                    .tool
+                    .as_ref()
+                    .and_then(|tool| tool.uv.as_ref())
+                    .and_then(|uv| uv.dev_dependencies.as_ref())
+                    .is_some()
+                {
+                    groups.push(DEV_DEPENDENCIES.clone());
+                    groups.sort_unstable();
+                }
+                groups
+            };
+            if groups.is_empty() {
+                return None;
+            }
+
+            Some(Requirement {
+                name: member.pyproject_toml.project.as_ref()?.name.clone(),
+                extras: vec![],
+                groups,
+                marker: MarkerTree::TRUE,
+                source: if member.pyproject_toml.is_package() {
+                    RequirementSource::Directory {
+                        install_path: member.root.clone(),
+                        editable: true,
+                        r#virtual: false,
+                        url,
+                    }
+                } else {
+                    RequirementSource::Directory {
+                        install_path: member.root.clone(),
+                        editable: false,
+                        r#virtual: true,
+                        url,
+                    }
+                },
+                origin: None,
+            })
+        })
+    }
+
+    /// Returns the set of supported environments for the workspace.
+    pub fn environments(&self) -> Option<&SupportedEnvironments> {
+        self.pyproject_toml
+            .tool
+            .as_ref()
+            .and_then(|tool| tool.uv.as_ref())
+            .and_then(|uv| uv.environments.as_ref())
+    }
+
+    /// Returns the set of required platforms for the workspace.
+    pub fn required_environments(&self) -> Option<&SupportedEnvironments> {
+        self.pyproject_toml
+            .tool
+            .as_ref()
+            .and_then(|tool| tool.uv.as_ref())
+            .and_then(|uv| uv.required_environments.as_ref())
+    }
+
+    /// Returns the set of conflicts for the workspace.
+    pub fn conflicts(&self) -> Conflicts {
+        let mut conflicting = Conflicts::empty();
+        for member in self.packages.values() {
+            conflicting.append(&mut member.pyproject_toml.conflicts());
+        }
+        conflicting
+    }
+
+    /// Returns an iterator over the `requires-python` values for each member of the workspace.
+    pub fn requires_python(&self) -> impl Iterator<Item = (&PackageName, &VersionSpecifiers)> {
+        self.packages().iter().filter_map(|(name, member)| {
+            member
+                .pyproject_toml()
+                .project
+                .as_ref()
+                .and_then(|project| project.requires_python.as_ref())
+                .map(|requires_python| (name, requires_python))
+        })
+    }
+
     /// Returns any requirements that are exclusive to the workspace root, i.e., not included in
     /// any of the workspace members.
     ///
-    /// For workspaces with non-project roots, returns the dev dependencies in the corresponding
-    /// `pyproject.toml`.
+    /// For now, there are no such requirements.
+    pub fn requirements(&self) -> Vec<uv_pep508::Requirement<VerbatimParsedUrl>> {
+        Vec::new()
+    }
+
+    /// Returns any dependency groups that are exclusive to the workspace root, i.e., not included
+    /// in any of the workspace members.
+    ///
+    /// For workspaces with non-`[project]` roots, returns the dependency groups defined in the
+    /// corresponding `pyproject.toml`.
     ///
     /// Otherwise, returns an empty list.
-    pub fn non_project_requirements(&self) -> impl Iterator<Item = Requirement> + '_ {
+    pub fn dependency_groups(
+        &self,
+    ) -> Result<
+        BTreeMap<GroupName, Vec<uv_pep508::Requirement<VerbatimParsedUrl>>>,
+        DependencyGroupError,
+    > {
         if self
             .packages
             .values()
@@ -329,40 +432,46 @@ impl Workspace {
         {
             // If the workspace has an explicit root, the root is a member, so we don't need to
             // include any root-only requirements.
-            Either::Left(std::iter::empty())
+            Ok(BTreeMap::default())
         } else {
-            // Otherwise, return the dev dependencies in the non-project workspace root.
-            Either::Right(
-                self.pyproject_toml
-                    .tool
-                    .as_ref()
-                    .and_then(|tool| tool.uv.as_ref())
-                    .and_then(|uv| uv.dev_dependencies.as_ref())
-                    .into_iter()
-                    .flatten()
-                    .map(|requirement| {
-                        Requirement::from(
-                            requirement
-                                .clone()
-                                .with_origin(RequirementOrigin::Workspace),
-                        )
-                    }),
-            )
+            // Otherwise, return the dependency groups in the non-project workspace root.
+            // First, collect `tool.uv.dev_dependencies`
+            let dev_dependencies = self
+                .pyproject_toml
+                .tool
+                .as_ref()
+                .and_then(|tool| tool.uv.as_ref())
+                .and_then(|uv| uv.dev_dependencies.as_ref());
+
+            // Then, collect `dependency-groups`
+            let dependency_groups = self
+                .pyproject_toml
+                .dependency_groups
+                .iter()
+                .flatten()
+                .collect::<BTreeMap<_, _>>();
+
+            // Flatten the dependency groups.
+            let mut dependency_groups =
+                FlatDependencyGroups::from_dependency_groups(&dependency_groups)
+                    .map_err(|err| err.with_dev_dependencies(dev_dependencies))?;
+
+            // Add the `dev` group, if `dev-dependencies` is defined.
+            if let Some(dev_dependencies) = dev_dependencies {
+                dependency_groups
+                    .entry(DEV_DEPENDENCIES.clone())
+                    .or_insert_with(Vec::new)
+                    .extend(dev_dependencies.clone());
+            }
+
+            Ok(dependency_groups.into_inner())
         }
     }
 
     /// Returns the set of overrides for the workspace.
-    pub fn overrides(&self) -> Vec<Requirement> {
-        let Some(workspace_package) = self
-            .packages
-            .values()
-            .find(|workspace_package| workspace_package.root() == self.install_path())
-        else {
-            return vec![];
-        };
-
-        let Some(overrides) = workspace_package
-            .pyproject_toml()
+    pub fn overrides(&self) -> Vec<uv_pep508::Requirement<VerbatimParsedUrl>> {
+        let Some(overrides) = self
+            .pyproject_toml
             .tool
             .as_ref()
             .and_then(|tool| tool.uv.as_ref())
@@ -370,46 +479,13 @@ impl Workspace {
         else {
             return vec![];
         };
-
-        overrides
-            .iter()
-            .map(|requirement| {
-                Requirement::from(
-                    requirement
-                        .clone()
-                        .with_origin(RequirementOrigin::Workspace),
-                )
-            })
-            .collect()
-    }
-
-    /// Returns the set of supported environments for the workspace.
-    pub fn environments(&self) -> Option<&SupportedEnvironments> {
-        let workspace_package = self
-            .packages
-            .values()
-            .find(|workspace_package| workspace_package.root() == self.install_path())?;
-
-        workspace_package
-            .pyproject_toml()
-            .tool
-            .as_ref()
-            .and_then(|tool| tool.uv.as_ref())
-            .and_then(|uv| uv.environments.as_ref())
+        overrides.clone()
     }
 
     /// Returns the set of constraints for the workspace.
-    pub fn constraints(&self) -> Vec<Requirement> {
-        let Some(workspace_package) = self
-            .packages
-            .values()
-            .find(|workspace_package| workspace_package.root() == self.install_path())
-        else {
-            return vec![];
-        };
-
-        let Some(constraints) = workspace_package
-            .pyproject_toml()
+    pub fn constraints(&self) -> Vec<uv_pep508::Requirement<VerbatimParsedUrl>> {
+        let Some(constraints) = self
+            .pyproject_toml
             .tool
             .as_ref()
             .and_then(|tool| tool.uv.as_ref())
@@ -417,17 +493,21 @@ impl Workspace {
         else {
             return vec![];
         };
+        constraints.clone()
+    }
 
-        constraints
-            .iter()
-            .map(|requirement| {
-                Requirement::from(
-                    requirement
-                        .clone()
-                        .with_origin(RequirementOrigin::Workspace),
-                )
-            })
-            .collect()
+    /// Returns the set of build constraints for the workspace.
+    pub fn build_constraints(&self) -> Vec<uv_pep508::Requirement<VerbatimParsedUrl>> {
+        let Some(build_constraints) = self
+            .pyproject_toml
+            .tool
+            .as_ref()
+            .and_then(|tool| tool.uv.as_ref())
+            .and_then(|uv| uv.build_constraint_dependencies.as_ref())
+        else {
+            return vec![];
+        };
+        build_constraints.clone()
     }
 
     /// The path to the workspace root, the directory containing the top level `pyproject.toml` with
@@ -442,10 +522,14 @@ impl Workspace {
     ///
     /// If `UV_PROJECT_ENVIRONMENT` is set, it will take precedence. If a relative path is provided,
     /// it is resolved relative to the install path.
-    pub fn venv(&self) -> PathBuf {
+    ///
+    /// If `active` is `true`, the `VIRTUAL_ENV` variable will be preferred. If it is `false`, any
+    /// warnings about mismatch between the active environment and the project environment will be
+    /// silenced.
+    pub fn venv(&self, active: Option<bool>) -> PathBuf {
         /// Resolve the `UV_PROJECT_ENVIRONMENT` value, if any.
         fn from_project_environment_variable(workspace: &Workspace) -> Option<PathBuf> {
-            let value = std::env::var_os("UV_PROJECT_ENVIRONMENT")?;
+            let value = std::env::var_os(EnvVars::UV_PROJECT_ENVIRONMENT)?;
 
             if value.is_empty() {
                 return None;
@@ -460,9 +544,9 @@ impl Workspace {
             Some(workspace.install_path.join(path))
         }
 
-        // Resolve the `VIRTUAL_ENV` variable, if any.
+        /// Resolve the `VIRTUAL_ENV` variable, if any.
         fn from_virtual_env_variable() -> Option<PathBuf> {
-            let value = std::env::var_os("VIRTUAL_ENV")?;
+            let value = std::env::var_os(EnvVars::VIRTUAL_ENV)?;
 
             if value.is_empty() {
                 return None;
@@ -478,42 +562,37 @@ impl Workspace {
             Some(CWD.join(path))
         }
 
-        // Attempt to check if the two paths refer to the same directory.
-        fn is_same_dir(left: &Path, right: &Path) -> Option<bool> {
-            // First, attempt to check directly
-            if let Ok(value) = same_file::is_same_file(left, right) {
-                return Some(value);
-            };
-
-            // Often, one of the directories won't exist yet so perform the comparison up a level
-            if let (Some(left_parent), Some(right_parent), Some(left_name), Some(right_name)) = (
-                left.parent(),
-                right.parent(),
-                left.file_name(),
-                right.file_name(),
-            ) {
-                match same_file::is_same_file(left_parent, right_parent) {
-                    Ok(true) => return Some(left_name == right_name),
-                    Ok(false) => return Some(false),
-                    _ => (),
-                }
-            };
-
-            // We couldn't determine if they're the same
-            None
-        }
-
         // Determine the default value
         let project_env = from_project_environment_variable(self)
             .unwrap_or_else(|| self.install_path.join(".venv"));
 
         // Warn if it conflicts with `VIRTUAL_ENV`
         if let Some(from_virtual_env) = from_virtual_env_variable() {
-            if !is_same_dir(&from_virtual_env, &project_env).unwrap_or(false) {
-                warn_user_once!(
-                    "`VIRTUAL_ENV={}` does not match the project environment path `{}` and will be ignored",
-                    from_virtual_env.user_display(),
-                    project_env.user_display()
+            if !uv_fs::is_same_file_allow_missing(&from_virtual_env, &project_env).unwrap_or(false)
+            {
+                match active {
+                    Some(true) => {
+                        debug!(
+                            "Using active virtual environment `{}` instead of project environment `{}`",
+                            from_virtual_env.user_display(),
+                            project_env.user_display()
+                        );
+                        return from_virtual_env;
+                    }
+                    Some(false) => {}
+                    None => {
+                        warn_user_once!(
+                            "`VIRTUAL_ENV={}` does not match the project environment path `{}` and will be ignored; use `--active` to target the active environment instead",
+                            from_virtual_env.user_display(),
+                            project_env.user_display()
+                        );
+                    }
+                }
+            }
+        } else {
+            if active.unwrap_or_default() {
+                debug!(
+                    "Use of the active virtual environment was requested, but `VIRTUAL_ENV` is not set"
                 );
             }
         }
@@ -527,24 +606,13 @@ impl Workspace {
     }
 
     /// The sources table from the workspace `pyproject.toml`.
-    pub fn sources(&self) -> &BTreeMap<PackageName, Source> {
+    pub fn sources(&self) -> &BTreeMap<PackageName, Sources> {
         &self.sources
     }
 
-    /// Returns an iterator over all sources in the workspace.
-    pub fn iter_sources(&self) -> impl Iterator<Item = &Source> {
-        self.packages
-            .values()
-            .filter_map(|member| {
-                member.pyproject_toml().tool.as_ref().and_then(|tool| {
-                    tool.uv
-                        .as_ref()
-                        .and_then(|uv| uv.sources.as_ref())
-                        .map(ToolUvSources::inner)
-                        .map(|sources| sources.values())
-                })
-            })
-            .flatten()
+    /// The index table from the workspace `pyproject.toml`.
+    pub fn indexes(&self) -> &[Index] {
+        &self.indexes
     }
 
     /// The `pyproject.toml` of the workspace.
@@ -613,14 +681,20 @@ impl Workspace {
                 );
 
                 seen.insert(workspace_root.clone());
-                workspace_members.insert(
+                if let Some(existing) = workspace_members.insert(
                     project.name.clone(),
                     WorkspaceMember {
                         root: workspace_root.clone(),
                         project: project.clone(),
                         pyproject_toml,
                     },
-                );
+                ) {
+                    return Err(WorkspaceError::DuplicatePackage {
+                        name: project.name.clone(),
+                        first: existing.root.clone(),
+                        second: workspace_root,
+                    });
+                }
             };
         }
 
@@ -637,16 +711,17 @@ impl Workspace {
 
         // Add all other workspace members.
         for member_glob in workspace_definition.clone().members.unwrap_or_default() {
-            let absolute_glob = workspace_root
-                .simplified()
-                .join(member_glob.as_str())
-                .to_string_lossy()
-                .to_string();
+            let absolute_glob = PathBuf::from(glob::Pattern::escape(
+                workspace_root.simplified().to_string_lossy().as_ref(),
+            ))
+            .join(member_glob.as_str())
+            .to_string_lossy()
+            .to_string();
             for member_root in glob(&absolute_glob)
                 .map_err(|err| WorkspaceError::Pattern(absolute_glob.to_string(), err))?
             {
                 let member_root = member_root
-                    .map_err(|err| WorkspaceError::Glob(absolute_glob.to_string(), err))?;
+                    .map_err(|err| WorkspaceError::GlobWalk(absolute_glob.to_string(), err))?;
                 if !seen.insert(member_root.clone()) {
                     continue;
                 }
@@ -706,12 +781,12 @@ impl Workspace {
                             member_glob.to_string(),
                         ));
                     }
-                    // If the entry is _not_ a directory, skip it.
-                    Err(_) if !member_root.is_dir() => {
+                    Err(err) if err.kind() == std::io::ErrorKind::NotADirectory => {
                         warn!(
                             "Ignoring non-directory workspace member: `{}`",
                             member_root.simplified_display()
                         );
+
                         continue;
                     }
                     Err(err) => return Err(err.into()),
@@ -743,16 +818,39 @@ impl Workspace {
                     "Adding discovered workspace member: `{}`",
                     member_root.simplified_display()
                 );
-                workspace_members.insert(
+
+                if let Some(existing) = workspace_members.insert(
                     project.name.clone(),
                     WorkspaceMember {
                         root: member_root.clone(),
                         project,
                         pyproject_toml,
                     },
-                );
+                ) {
+                    return Err(WorkspaceError::DuplicatePackage {
+                        name: existing.project.name,
+                        first: existing.root.clone(),
+                        second: member_root,
+                    });
+                }
             }
         }
+
+        // Test for nested workspaces.
+        for member in workspace_members.values() {
+            if member.root() != &workspace_root
+                && member
+                    .pyproject_toml
+                    .tool
+                    .as_ref()
+                    .and_then(|tool| tool.uv.as_ref())
+                    .and_then(|uv| uv.workspace.as_ref())
+                    .is_some()
+            {
+                return Err(WorkspaceError::NestedWorkspace(member.root.clone()));
+            }
+        }
+
         let workspace_sources = workspace_pyproject_toml
             .tool
             .clone()
@@ -761,10 +859,18 @@ impl Workspace {
             .map(ToolUvSources::into_inner)
             .unwrap_or_default();
 
+        let workspace_indexes = workspace_pyproject_toml
+            .tool
+            .clone()
+            .and_then(|tool| tool.uv)
+            .and_then(|uv| uv.index)
+            .unwrap_or_default();
+
         Ok(Workspace {
             install_path: workspace_root,
             packages: workspace_members,
             sources: workspace_sources,
+            indexes: workspace_indexes,
             pyproject_toml: workspace_pyproject_toml,
         })
     }
@@ -904,6 +1010,7 @@ impl ProjectWorkspace {
                 // Only walk up the given directory, if any.
                 options
                     .stop_discovery_at
+                    .and_then(Path::parent)
                     .map(|stop_discovery_at| stop_discovery_at != *path)
                     .unwrap_or(true)
             })
@@ -933,7 +1040,7 @@ impl ProjectWorkspace {
         let project = pyproject_toml
             .project
             .clone()
-            .ok_or_else(|| WorkspaceError::MissingProject(pyproject_path))?;
+            .ok_or(WorkspaceError::MissingProject(pyproject_path))?;
 
         Self::from_project(project_root, &project, &pyproject_toml, options).await
     }
@@ -1066,6 +1173,7 @@ impl ProjectWorkspace {
                     // There may be package sources, but we don't need to duplicate them into the
                     // workspace sources.
                     sources: BTreeMap::default(),
+                    indexes: Vec::default(),
                     pyproject_toml: project_pyproject_toml.clone(),
                 },
             });
@@ -1105,6 +1213,7 @@ async fn find_workspace(
             // Only walk up the given directory, if any.
             options
                 .stop_discovery_at
+                .and_then(Path::parent)
                 .map(|stop_discovery_at| stop_discovery_at != *path)
                 .unwrap_or(true)
         })
@@ -1189,94 +1298,6 @@ async fn find_workspace(
     Ok(None)
 }
 
-/// Warn when the valid workspace is included in another workspace.
-pub fn check_nested_workspaces(inner_workspace_root: &Path, options: &DiscoveryOptions) {
-    for outer_workspace_root in inner_workspace_root
-        .ancestors()
-        .take_while(|path| {
-            // Only walk up the given directory, if any.
-            options
-                .stop_discovery_at
-                .map(|stop_discovery_at| stop_discovery_at != *path)
-                .unwrap_or(true)
-        })
-        .skip(1)
-    {
-        let pyproject_toml_path = outer_workspace_root.join("pyproject.toml");
-        if !pyproject_toml_path.is_file() {
-            continue;
-        }
-        let contents = match fs_err::read_to_string(&pyproject_toml_path) {
-            Ok(contents) => contents,
-            Err(err) => {
-                warn!(
-                    "Unreadable pyproject.toml `{}`: {err}",
-                    pyproject_toml_path.simplified_display()
-                );
-                return;
-            }
-        };
-        let pyproject_toml: PyProjectToml = match toml::from_str(&contents) {
-            Ok(contents) => contents,
-            Err(err) => {
-                warn!(
-                    "Invalid pyproject.toml `{}`: {err}",
-                    pyproject_toml_path.simplified_display()
-                );
-                return;
-            }
-        };
-
-        if let Some(workspace) = pyproject_toml
-            .tool
-            .as_ref()
-            .and_then(|tool| tool.uv.as_ref())
-            .and_then(|uv| uv.workspace.as_ref())
-        {
-            let is_included = match is_included_in_workspace(
-                inner_workspace_root,
-                outer_workspace_root,
-                workspace,
-            ) {
-                Ok(contents) => contents,
-                Err(err) => {
-                    warn!(
-                        "Invalid pyproject.toml `{}`: {err}",
-                        pyproject_toml_path.simplified_display()
-                    );
-                    return;
-                }
-            };
-
-            let is_excluded = match is_excluded_from_workspace(
-                inner_workspace_root,
-                outer_workspace_root,
-                workspace,
-            ) {
-                Ok(contents) => contents,
-                Err(err) => {
-                    warn!(
-                        "Invalid pyproject.toml `{}`: {err}",
-                        pyproject_toml_path.simplified_display()
-                    );
-                    return;
-                }
-            };
-
-            if is_included && !is_excluded {
-                warn_user!(
-                    "Nested workspaces are not supported, but outer workspace (`{}`) includes `{}`",
-                    outer_workspace_root.simplified_display().cyan(),
-                    inner_workspace_root.simplified_display().cyan()
-                );
-            }
-        }
-
-        // We're in the examples or tests of another project (not a workspace), this is fine.
-        return;
-    }
-}
-
 /// Check if we're in the `tool.uv.workspace.excluded` of a workspace.
 fn is_excluded_from_workspace(
     project_path: &Path,
@@ -1284,19 +1305,15 @@ fn is_excluded_from_workspace(
     workspace: &ToolUvWorkspace,
 ) -> Result<bool, WorkspaceError> {
     for exclude_glob in workspace.exclude.iter().flatten() {
-        let absolute_glob = workspace_root
-            .simplified()
-            .join(exclude_glob.as_str())
-            .to_string_lossy()
-            .to_string();
-        for excluded_root in glob(&absolute_glob)
-            .map_err(|err| WorkspaceError::Pattern(absolute_glob.to_string(), err))?
-        {
-            let excluded_root = excluded_root
-                .map_err(|err| WorkspaceError::Glob(absolute_glob.to_string(), err))?;
-            if excluded_root == project_path.simplified() {
-                return Ok(true);
-            }
+        let absolute_glob = PathBuf::from(glob::Pattern::escape(
+            workspace_root.simplified().to_string_lossy().as_ref(),
+        ))
+        .join(exclude_glob.as_str());
+        let absolute_glob = absolute_glob.to_string_lossy();
+        let exclude_pattern = glob::Pattern::new(&absolute_glob)
+            .map_err(|err| WorkspaceError::Pattern(absolute_glob.to_string(), err))?;
+        if exclude_pattern.matches_path(project_path) {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -1309,19 +1326,15 @@ fn is_included_in_workspace(
     workspace: &ToolUvWorkspace,
 ) -> Result<bool, WorkspaceError> {
     for member_glob in workspace.members.iter().flatten() {
-        let absolute_glob = workspace_root
-            .simplified()
-            .join(member_glob.as_str())
-            .to_string_lossy()
-            .to_string();
-        for member_root in glob(&absolute_glob)
-            .map_err(|err| WorkspaceError::Pattern(absolute_glob.to_string(), err))?
-        {
-            let member_root =
-                member_root.map_err(|err| WorkspaceError::Glob(absolute_glob.to_string(), err))?;
-            if member_root == project_path {
-                return Ok(true);
-            }
+        let absolute_glob = PathBuf::from(glob::Pattern::escape(
+            workspace_root.simplified().to_string_lossy().as_ref(),
+        ))
+        .join(member_glob.as_str());
+        let absolute_glob = absolute_glob.to_string_lossy();
+        let include_pattern = glob::Pattern::new(&absolute_glob)
+            .map_err(|err| WorkspaceError::Pattern(absolute_glob.to_string(), err))?;
+        if include_pattern.matches_path(project_path) {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -1361,6 +1374,7 @@ impl VirtualProject {
                 // Only walk up the given directory, if any.
                 options
                     .stop_discovery_at
+                    .and_then(Path::parent)
                     .map(|stop_discovery_at| stop_discovery_at != *path)
                     .unwrap_or(true)
             })
@@ -1395,8 +1409,6 @@ impl VirtualProject {
             let project_path = std::path::absolute(project_root)
                 .map_err(WorkspaceError::Normalize)?
                 .clone();
-
-            check_nested_workspaces(&project_path, options);
 
             let workspace = Workspace::collect_members(
                 project_path,
@@ -1471,109 +1483,23 @@ impl VirtualProject {
     }
 }
 
-/// A target that can be installed.
-#[derive(Debug, Clone, Copy)]
-pub enum InstallTarget<'env> {
-    /// A project (which could be a workspace root or member).
-    Project(&'env ProjectWorkspace),
-    /// A (legacy) non-project workspace root.
-    NonProject(&'env Workspace),
-    /// A frozen member within a [`Workspace`].
-    FrozenMember(&'env Workspace, &'env PackageName),
-}
-
-impl<'env> InstallTarget<'env> {
-    /// Create an [`InstallTarget`] for a frozen member within a workspace.
-    pub fn frozen_member(project: &'env VirtualProject, package_name: &'env PackageName) -> Self {
-        Self::FrozenMember(project.workspace(), package_name)
-    }
-
-    /// Return the [`Workspace`] of the target.
-    pub fn workspace(&self) -> &Workspace {
-        match self {
-            Self::Project(project) => project.workspace(),
-            Self::NonProject(workspace) => workspace,
-            Self::FrozenMember(workspace, _) => workspace,
-        }
-    }
-
-    /// Return the [`PackageName`] of the target.
-    pub fn packages(&self) -> impl Iterator<Item = &PackageName> {
-        match self {
-            Self::Project(project) => Either::Left(std::iter::once(project.project_name())),
-            Self::NonProject(workspace) => Either::Right(workspace.packages().keys()),
-            Self::FrozenMember(_, package_name) => Either::Left(std::iter::once(*package_name)),
-        }
-    }
-
-    /// Return the [`InstallTarget`] dependencies for the given group name.
-    ///
-    /// Returns dependencies that apply to the workspace root, but not any of its members. As such,
-    /// only returns a non-empty iterator for virtual workspaces, which can include dev dependencies
-    /// on the virtual root.
-    pub fn group(
-        &self,
-        name: &GroupName,
-    ) -> impl Iterator<Item = &pep508_rs::Requirement<VerbatimParsedUrl>> {
-        match self {
-            Self::Project(_) | Self::FrozenMember(..) => {
-                // For projects, dev dependencies are attached to the members.
-                Either::Left(std::iter::empty())
-            }
-            Self::NonProject(workspace) => {
-                // For non-projects, we might have dev dependencies that are attached to the
-                // workspace root (which isn't a member).
-                if name == &*DEV_DEPENDENCIES {
-                    Either::Right(
-                        workspace
-                            .pyproject_toml
-                            .tool
-                            .as_ref()
-                            .and_then(|tool| tool.uv.as_ref())
-                            .and_then(|uv| uv.dev_dependencies.as_ref())
-                            .map(|dev| dev.iter())
-                            .into_iter()
-                            .flatten(),
-                    )
-                } else {
-                    Either::Left(std::iter::empty())
-                }
-            }
-        }
-    }
-
-    /// Return the [`PackageName`] of the target, if available.
-    pub fn project_name(&self) -> Option<&PackageName> {
-        match self {
-            Self::Project(project) => Some(project.project_name()),
-            Self::NonProject(_) => None,
-            Self::FrozenMember(_, package_name) => Some(package_name),
-        }
-    }
-}
-
-impl<'env> From<&'env VirtualProject> for InstallTarget<'env> {
-    fn from(project: &'env VirtualProject) -> Self {
-        match project {
-            VirtualProject::Project(project) => Self::Project(project),
-            VirtualProject::NonProject(workspace) => Self::NonProject(workspace),
-        }
-    }
-}
-
 #[cfg(test)]
 #[cfg(unix)] // Avoid path escaping for the unit tests
 mod tests {
     use std::env;
-
     use std::path::Path;
+    use std::str::FromStr;
 
     use anyhow::Result;
     use assert_fs::fixture::ChildPath;
     use assert_fs::prelude::*;
-    use insta::assert_json_snapshot;
+    use insta::{assert_json_snapshot, assert_snapshot};
 
+    use uv_normalize::GroupName;
+
+    use crate::pyproject::{DependencyGroupSpecifier, PyProjectToml};
     use crate::workspace::{DiscoveryOptions, ProjectWorkspace};
+    use crate::WorkspaceError;
 
     async fn workspace_test(folder: &str) -> (ProjectWorkspace, String) {
         let root_dir = env::current_dir()
@@ -1592,12 +1518,15 @@ mod tests {
         (project, root_escaped)
     }
 
-    async fn temporary_test(folder: &Path) -> (ProjectWorkspace, String) {
+    async fn temporary_test(
+        folder: &Path,
+    ) -> Result<(ProjectWorkspace, String), (WorkspaceError, String)> {
+        let root_escaped = regex::escape(folder.to_string_lossy().as_ref());
         let project = ProjectWorkspace::discover(folder, &DiscoveryOptions::default())
             .await
-            .unwrap();
-        let root_escaped = regex::escape(folder.to_string_lossy().as_ref());
-        (project, root_escaped)
+            .map_err(|error| (error, root_escaped.clone()))?;
+
+        Ok((project, root_escaped))
     }
 
     #[tokio::test]
@@ -1612,42 +1541,44 @@ mod tests {
                 ".workspace.packages.*.pyproject_toml" => "[PYPROJECT_TOML]"
             },
             @r###"
-        {
-          "project_root": "[ROOT]/albatross-in-example/examples/bird-feeder",
-          "project_name": "bird-feeder",
-          "workspace": {
-            "install_path": "[ROOT]/albatross-in-example/examples/bird-feeder",
-            "packages": {
-              "bird-feeder": {
-                "root": "[ROOT]/albatross-in-example/examples/bird-feeder",
-                "project": {
-                  "name": "bird-feeder",
-                  "version": "1.0.0",
-                  "requires-python": ">=3.12",
-                  "dependencies": [
-                    "anyio>=4.3.0,<5"
-                  ],
-                  "optional-dependencies": null
-                },
-                "pyproject_toml": "[PYPROJECT_TOML]"
-              }
+    {
+      "project_root": "[ROOT]/albatross-in-example/examples/bird-feeder",
+      "project_name": "bird-feeder",
+      "workspace": {
+        "install_path": "[ROOT]/albatross-in-example/examples/bird-feeder",
+        "packages": {
+          "bird-feeder": {
+            "root": "[ROOT]/albatross-in-example/examples/bird-feeder",
+            "project": {
+              "name": "bird-feeder",
+              "version": "1.0.0",
+              "requires-python": ">=3.12",
+              "dependencies": [
+                "anyio>=4.3.0,<5"
+              ],
+              "optional-dependencies": null
             },
-            "sources": {},
-            "pyproject_toml": {
-              "project": {
-                "name": "bird-feeder",
-                "version": "1.0.0",
-                "requires-python": ">=3.12",
-                "dependencies": [
-                  "anyio>=4.3.0,<5"
-                ],
-                "optional-dependencies": null
-              },
-              "tool": null
-            }
+            "pyproject_toml": "[PYPROJECT_TOML]"
           }
+        },
+        "sources": {},
+        "indexes": [],
+        "pyproject_toml": {
+          "project": {
+            "name": "bird-feeder",
+            "version": "1.0.0",
+            "requires-python": ">=3.12",
+            "dependencies": [
+              "anyio>=4.3.0,<5"
+            ],
+            "optional-dependencies": null
+          },
+          "tool": null,
+          "dependency-groups": null
         }
-        "###);
+      }
+    }
+    "###);
         });
     }
 
@@ -1663,42 +1594,44 @@ mod tests {
                 ".workspace.packages.*.pyproject_toml" => "[PYPROJECT_TOML]"
             },
             @r###"
-            {
-              "project_root": "[ROOT]/albatross-project-in-excluded/excluded/bird-feeder",
-              "project_name": "bird-feeder",
-              "workspace": {
-                "install_path": "[ROOT]/albatross-project-in-excluded/excluded/bird-feeder",
-                "packages": {
-                  "bird-feeder": {
-                    "root": "[ROOT]/albatross-project-in-excluded/excluded/bird-feeder",
-                    "project": {
-                      "name": "bird-feeder",
-                      "version": "1.0.0",
-                      "requires-python": ">=3.12",
-                      "dependencies": [
-                        "anyio>=4.3.0,<5"
-                      ],
-                      "optional-dependencies": null
-                    },
-                    "pyproject_toml": "[PYPROJECT_TOML]"
-                  }
+        {
+          "project_root": "[ROOT]/albatross-project-in-excluded/excluded/bird-feeder",
+          "project_name": "bird-feeder",
+          "workspace": {
+            "install_path": "[ROOT]/albatross-project-in-excluded/excluded/bird-feeder",
+            "packages": {
+              "bird-feeder": {
+                "root": "[ROOT]/albatross-project-in-excluded/excluded/bird-feeder",
+                "project": {
+                  "name": "bird-feeder",
+                  "version": "1.0.0",
+                  "requires-python": ">=3.12",
+                  "dependencies": [
+                    "anyio>=4.3.0,<5"
+                  ],
+                  "optional-dependencies": null
                 },
-                "sources": {},
-                "pyproject_toml": {
-                  "project": {
-                    "name": "bird-feeder",
-                    "version": "1.0.0",
-                    "requires-python": ">=3.12",
-                    "dependencies": [
-                      "anyio>=4.3.0,<5"
-                    ],
-                    "optional-dependencies": null
-                  },
-                  "tool": null
-                }
+                "pyproject_toml": "[PYPROJECT_TOML]"
               }
+            },
+            "sources": {},
+            "indexes": [],
+            "pyproject_toml": {
+              "project": {
+                "name": "bird-feeder",
+                "version": "1.0.0",
+                "requires-python": ">=3.12",
+                "dependencies": [
+                  "anyio>=4.3.0,<5"
+                ],
+                "optional-dependencies": null
+              },
+              "tool": null,
+              "dependency-groups": null
             }
-            "###);
+          }
+        }
+        "###);
         });
     }
 
@@ -1762,10 +1695,15 @@ mod tests {
                   }
                 },
                 "sources": {
-                  "bird-feeder": {
-                    "workspace": true
-                  }
+                  "bird-feeder": [
+                    {
+                      "workspace": true,
+                      "extra": null,
+                      "group": null
+                    }
+                  ]
                 },
+                "indexes": [],
                 "pyproject_toml": {
                   "project": {
                     "name": "albatross",
@@ -1780,10 +1718,15 @@ mod tests {
                   "tool": {
                     "uv": {
                       "sources": {
-                        "bird-feeder": {
-                          "workspace": true
-                        }
+                        "bird-feeder": [
+                          {
+                            "workspace": true,
+                            "extra": null,
+                            "group": null
+                          }
+                        ]
                       },
+                      "index": null,
                       "workspace": {
                         "members": [
                           "packages/*"
@@ -1792,12 +1735,17 @@ mod tests {
                       },
                       "managed": null,
                       "package": null,
+                      "default-groups": null,
                       "dev-dependencies": null,
-                      "environments": null,
                       "override-dependencies": null,
-                      "constraint-dependencies": null
+                      "constraint-dependencies": null,
+                      "build-constraint-dependencies": null,
+                      "environments": null,
+                      "required-environments": null,
+                      "conflicts": null
                     }
-                  }
+                  },
+                  "dependency-groups": null
                 }
               }
             }
@@ -1866,11 +1814,13 @@ mod tests {
                   }
                 },
                 "sources": {},
+                "indexes": [],
                 "pyproject_toml": {
                   "project": null,
                   "tool": {
                     "uv": {
                       "sources": null,
+                      "index": null,
                       "workspace": {
                         "members": [
                           "packages/*"
@@ -1879,12 +1829,17 @@ mod tests {
                       },
                       "managed": null,
                       "package": null,
+                      "default-groups": null,
                       "dev-dependencies": null,
-                      "environments": null,
                       "override-dependencies": null,
-                      "constraint-dependencies": null
+                      "constraint-dependencies": null,
+                      "build-constraint-dependencies": null,
+                      "environments": null,
+                      "required-environments": null,
+                      "conflicts": null
                     }
-                  }
+                  },
+                  "dependency-groups": null
                 }
               }
             }
@@ -1903,42 +1858,44 @@ mod tests {
                 ".workspace.packages.*.pyproject_toml" => "[PYPROJECT_TOML]"
             },
             @r###"
-            {
-              "project_root": "[ROOT]/albatross-just-project",
-              "project_name": "albatross",
-              "workspace": {
-                "install_path": "[ROOT]/albatross-just-project",
-                "packages": {
-                  "albatross": {
-                    "root": "[ROOT]/albatross-just-project",
-                    "project": {
-                      "name": "albatross",
-                      "version": "0.1.0",
-                      "requires-python": ">=3.12",
-                      "dependencies": [
-                        "tqdm>=4,<5"
-                      ],
-                      "optional-dependencies": null
-                    },
-                    "pyproject_toml": "[PYPROJECT_TOML]"
-                  }
+        {
+          "project_root": "[ROOT]/albatross-just-project",
+          "project_name": "albatross",
+          "workspace": {
+            "install_path": "[ROOT]/albatross-just-project",
+            "packages": {
+              "albatross": {
+                "root": "[ROOT]/albatross-just-project",
+                "project": {
+                  "name": "albatross",
+                  "version": "0.1.0",
+                  "requires-python": ">=3.12",
+                  "dependencies": [
+                    "tqdm>=4,<5"
+                  ],
+                  "optional-dependencies": null
                 },
-                "sources": {},
-                "pyproject_toml": {
-                  "project": {
-                    "name": "albatross",
-                    "version": "0.1.0",
-                    "requires-python": ">=3.12",
-                    "dependencies": [
-                      "tqdm>=4,<5"
-                    ],
-                    "optional-dependencies": null
-                  },
-                  "tool": null
-                }
+                "pyproject_toml": "[PYPROJECT_TOML]"
               }
+            },
+            "sources": {},
+            "indexes": [],
+            "pyproject_toml": {
+              "project": {
+                "name": "albatross",
+                "version": "0.1.0",
+                "requires-python": ">=3.12",
+                "dependencies": [
+                  "tqdm>=4,<5"
+                ],
+                "optional-dependencies": null
+              },
+              "tool": null,
+              "dependency-groups": null
             }
-            "###);
+          }
+        }
+        "###);
         });
     }
     #[tokio::test]
@@ -1949,20 +1906,20 @@ mod tests {
         // Create the root.
         root.child("pyproject.toml").write_str(
             r#"
-                [project]
-                name = "albatross"
-                version = "0.1.0"
-                requires-python = ">=3.12"
-                dependencies = ["tqdm>=4,<5"]
+            [project]
+            name = "albatross"
+            version = "0.1.0"
+            requires-python = ">=3.12"
+            dependencies = ["tqdm>=4,<5"]
 
-                [tool.uv.workspace]
-                members = ["packages/*"]
-                exclude = ["packages/bird-feeder"]
+            [tool.uv.workspace]
+            members = ["packages/*"]
+            exclude = ["packages/bird-feeder"]
 
-                [build-system]
-                requires = ["hatchling"]
-                build-backend = "hatchling.build"
-                "#,
+            [build-system]
+            requires = ["hatchling"]
+            build-backend = "hatchling.build"
+            "#,
         )?;
         root.child("albatross").child("__init__.py").touch()?;
 
@@ -1972,16 +1929,16 @@ mod tests {
             .child("pyproject.toml")
             .write_str(
                 r#"
-                [project]
-                name = "seeds"
-                version = "1.0.0"
-                requires-python = ">=3.12"
-                dependencies = ["idna==3.6"]
+            [project]
+            name = "seeds"
+            version = "1.0.0"
+            requires-python = ">=3.12"
+            dependencies = ["idna==3.6"]
 
-                [build-system]
-                requires = ["hatchling"]
-                build-backend = "hatchling.build"
-                "#,
+            [build-system]
+            requires = ["hatchling"]
+            build-backend = "hatchling.build"
+            "#,
             )?;
         root.child("packages")
             .child("seeds")
@@ -1995,16 +1952,16 @@ mod tests {
             .child("pyproject.toml")
             .write_str(
                 r#"
-                [project]
-                name = "bird-feeder"
-                version = "1.0.0"
-                requires-python = ">=3.12"
-                dependencies = ["anyio>=4.3.0,<5"]
+            [project]
+            name = "bird-feeder"
+            version = "1.0.0"
+            requires-python = ">=3.12"
+            dependencies = ["anyio>=4.3.0,<5"]
 
-                [build-system]
-                requires = ["hatchling"]
-                build-backend = "hatchling.build"
-                "#,
+            [build-system]
+            requires = ["hatchling"]
+            build-backend = "hatchling.build"
+            "#,
             )?;
         root.child("packages")
             .child("bird-feeder")
@@ -2012,7 +1969,7 @@ mod tests {
             .child("__init__.py")
             .touch()?;
 
-        let (project, root_escaped) = temporary_test(root.as_ref()).await;
+        let (project, root_escaped) = temporary_test(root.as_ref()).await.unwrap();
         let filters = vec![(root_escaped.as_str(), "[ROOT]")];
         insta::with_settings!({filters => filters}, {
             assert_json_snapshot!(
@@ -2055,6 +2012,7 @@ mod tests {
                   }
                 },
                 "sources": {},
+                "indexes": [],
                 "pyproject_toml": {
                   "project": {
                     "name": "albatross",
@@ -2068,6 +2026,7 @@ mod tests {
                   "tool": {
                     "uv": {
                       "sources": null,
+                      "index": null,
                       "workspace": {
                         "members": [
                           "packages/*"
@@ -2078,12 +2037,17 @@ mod tests {
                       },
                       "managed": null,
                       "package": null,
+                      "default-groups": null,
                       "dev-dependencies": null,
-                      "environments": null,
                       "override-dependencies": null,
-                      "constraint-dependencies": null
+                      "constraint-dependencies": null,
+                      "build-constraint-dependencies": null,
+                      "environments": null,
+                      "required-environments": null,
+                      "conflicts": null
                     }
-                  }
+                  },
+                  "dependency-groups": null
                 }
               }
             }
@@ -2093,24 +2057,24 @@ mod tests {
         // Rewrite the members to both include and exclude `bird-feeder` by name.
         root.child("pyproject.toml").write_str(
             r#"
-                [project]
-                name = "albatross"
-                version = "0.1.0"
-                requires-python = ">=3.12"
-                dependencies = ["tqdm>=4,<5"]
+            [project]
+            name = "albatross"
+            version = "0.1.0"
+            requires-python = ">=3.12"
+            dependencies = ["tqdm>=4,<5"]
 
-                [tool.uv.workspace]
-                members = ["packages/seeds", "packages/bird-feeder"]
-                exclude = ["packages/bird-feeder"]
+            [tool.uv.workspace]
+            members = ["packages/seeds", "packages/bird-feeder"]
+            exclude = ["packages/bird-feeder"]
 
-                [build-system]
-                requires = ["hatchling"]
-                build-backend = "hatchling.build"
-                "#,
+            [build-system]
+            requires = ["hatchling"]
+            build-backend = "hatchling.build"
+            "#,
         )?;
 
         // `bird-feeder` should still be excluded.
-        let (project, root_escaped) = temporary_test(root.as_ref()).await;
+        let (project, root_escaped) = temporary_test(root.as_ref()).await.unwrap();
         let filters = vec![(root_escaped.as_str(), "[ROOT]")];
         insta::with_settings!({filters => filters}, {
             assert_json_snapshot!(
@@ -2153,6 +2117,7 @@ mod tests {
                   }
                 },
                 "sources": {},
+                "indexes": [],
                 "pyproject_toml": {
                   "project": {
                     "name": "albatross",
@@ -2166,6 +2131,7 @@ mod tests {
                   "tool": {
                     "uv": {
                       "sources": null,
+                      "index": null,
                       "workspace": {
                         "members": [
                           "packages/seeds",
@@ -2177,12 +2143,17 @@ mod tests {
                       },
                       "managed": null,
                       "package": null,
+                      "default-groups": null,
                       "dev-dependencies": null,
-                      "environments": null,
                       "override-dependencies": null,
-                      "constraint-dependencies": null
+                      "constraint-dependencies": null,
+                      "build-constraint-dependencies": null,
+                      "environments": null,
+                      "required-environments": null,
+                      "conflicts": null
                     }
-                  }
+                  },
+                  "dependency-groups": null
                 }
               }
             }
@@ -2192,24 +2163,24 @@ mod tests {
         // Rewrite the exclusion to use the top-level directory (`packages`).
         root.child("pyproject.toml").write_str(
             r#"
-                [project]
-                name = "albatross"
-                version = "0.1.0"
-                requires-python = ">=3.12"
-                dependencies = ["tqdm>=4,<5"]
+            [project]
+            name = "albatross"
+            version = "0.1.0"
+            requires-python = ">=3.12"
+            dependencies = ["tqdm>=4,<5"]
 
-                [tool.uv.workspace]
-                members = ["packages/seeds", "packages/bird-feeder"]
-                exclude = ["packages"]
+            [tool.uv.workspace]
+            members = ["packages/seeds", "packages/bird-feeder"]
+            exclude = ["packages"]
 
-                [build-system]
-                requires = ["hatchling"]
-                build-backend = "hatchling.build"
-                "#,
+            [build-system]
+            requires = ["hatchling"]
+            build-backend = "hatchling.build"
+            "#,
         )?;
 
         // `bird-feeder` should now be included.
-        let (project, root_escaped) = temporary_test(root.as_ref()).await;
+        let (project, root_escaped) = temporary_test(root.as_ref()).await.unwrap();
         let filters = vec![(root_escaped.as_str(), "[ROOT]")];
         insta::with_settings!({filters => filters}, {
             assert_json_snapshot!(
@@ -2265,6 +2236,7 @@ mod tests {
                   }
                 },
                 "sources": {},
+                "indexes": [],
                 "pyproject_toml": {
                   "project": {
                     "name": "albatross",
@@ -2278,6 +2250,7 @@ mod tests {
                   "tool": {
                     "uv": {
                       "sources": null,
+                      "index": null,
                       "workspace": {
                         "members": [
                           "packages/seeds",
@@ -2289,12 +2262,17 @@ mod tests {
                       },
                       "managed": null,
                       "package": null,
+                      "default-groups": null,
                       "dev-dependencies": null,
-                      "environments": null,
                       "override-dependencies": null,
-                      "constraint-dependencies": null
+                      "constraint-dependencies": null,
+                      "build-constraint-dependencies": null,
+                      "environments": null,
+                      "required-environments": null,
+                      "conflicts": null
                     }
-                  }
+                  },
+                  "dependency-groups": null
                 }
               }
             }
@@ -2304,24 +2282,24 @@ mod tests {
         // Rewrite the exclusion to use the top-level directory with a glob (`packages/*`).
         root.child("pyproject.toml").write_str(
             r#"
-                [project]
-                name = "albatross"
-                version = "0.1.0"
-                requires-python = ">=3.12"
-                dependencies = ["tqdm>=4,<5"]
+            [project]
+            name = "albatross"
+            version = "0.1.0"
+            requires-python = ">=3.12"
+            dependencies = ["tqdm>=4,<5"]
 
-                [tool.uv.workspace]
-                members = ["packages/seeds", "packages/bird-feeder"]
-                exclude = ["packages/*"]
+            [tool.uv.workspace]
+            members = ["packages/seeds", "packages/bird-feeder"]
+            exclude = ["packages/*"]
 
-                [build-system]
-                requires = ["hatchling"]
-                build-backend = "hatchling.build"
-                "#,
+            [build-system]
+            requires = ["hatchling"]
+            build-backend = "hatchling.build"
+            "#,
         )?;
 
         // `bird-feeder` and `seeds` should now be excluded.
-        let (project, root_escaped) = temporary_test(root.as_ref()).await;
+        let (project, root_escaped) = temporary_test(root.as_ref()).await.unwrap();
         let filters = vec![(root_escaped.as_str(), "[ROOT]")];
         insta::with_settings!({filters => filters}, {
             assert_json_snapshot!(
@@ -2351,6 +2329,7 @@ mod tests {
                   }
                 },
                 "sources": {},
+                "indexes": [],
                 "pyproject_toml": {
                   "project": {
                     "name": "albatross",
@@ -2364,6 +2343,7 @@ mod tests {
                   "tool": {
                     "uv": {
                       "sources": null,
+                      "index": null,
                       "workspace": {
                         "members": [
                           "packages/seeds",
@@ -2375,16 +2355,168 @@ mod tests {
                       },
                       "managed": null,
                       "package": null,
+                      "default-groups": null,
                       "dev-dependencies": null,
-                      "environments": null,
                       "override-dependencies": null,
-                      "constraint-dependencies": null
+                      "constraint-dependencies": null,
+                      "build-constraint-dependencies": null,
+                      "environments": null,
+                      "required-environments": null,
+                      "conflicts": null
                     }
-                  }
+                  },
+                  "dependency-groups": null
                 }
               }
             }
             "###);
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn read_dependency_groups() {
+        let toml = r#"
+[dependency-groups]
+foo = ["a", {include-group = "bar"}]
+bar = ["b"]
+"#;
+
+        let result =
+            PyProjectToml::from_string(toml.to_string()).expect("Deserialization should succeed");
+
+        let groups = result
+            .dependency_groups
+            .expect("`dependency-groups` should be present");
+        let foo = groups
+            .get(&GroupName::from_str("foo").unwrap())
+            .expect("Group `foo` should be present");
+        assert_eq!(
+            foo,
+            &[
+                DependencyGroupSpecifier::Requirement("a".to_string()),
+                DependencyGroupSpecifier::IncludeGroup {
+                    include_group: GroupName::from_str("bar").unwrap(),
+                }
+            ]
+        );
+
+        let bar = groups
+            .get(&GroupName::from_str("bar").unwrap())
+            .expect("Group `bar` should be present");
+        assert_eq!(
+            bar,
+            &[DependencyGroupSpecifier::Requirement("b".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_workspace() -> Result<()> {
+        let root = tempfile::TempDir::new()?;
+        let root = ChildPath::new(root.path());
+
+        // Create the root.
+        root.child("pyproject.toml").write_str(
+            r#"
+            [project]
+            name = "albatross"
+            version = "0.1.0"
+            requires-python = ">=3.12"
+            dependencies = ["tqdm>=4,<5"]
+
+            [tool.uv.workspace]
+            members = ["packages/*"]
+            "#,
+        )?;
+
+        // Create an included package (`seeds`).
+        root.child("packages")
+            .child("seeds")
+            .child("pyproject.toml")
+            .write_str(
+                r#"
+            [project]
+            name = "seeds"
+            version = "1.0.0"
+            requires-python = ">=3.12"
+            dependencies = ["idna==3.6"]
+
+            [tool.uv.workspace]
+            members = ["nested_packages/*"]
+            "#,
+            )?;
+
+        let (error, root_escaped) = temporary_test(root.as_ref()).await.unwrap_err();
+        let filters = vec![(root_escaped.as_str(), "[ROOT]")];
+        insta::with_settings!({filters => filters}, {
+            assert_snapshot!(
+                error,
+            @"Nested workspaces are not supported, but workspace member (`[ROOT]/packages/seeds`) has a `uv.workspace` table");
+        });
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_names() -> Result<()> {
+        let root = tempfile::TempDir::new()?;
+        let root = ChildPath::new(root.path());
+
+        // Create the root.
+        root.child("pyproject.toml").write_str(
+            r#"
+            [project]
+            name = "albatross"
+            version = "0.1.0"
+            requires-python = ">=3.12"
+            dependencies = ["tqdm>=4,<5"]
+
+            [tool.uv.workspace]
+            members = ["packages/*"]
+            "#,
+        )?;
+
+        // Create an included package (`seeds`).
+        root.child("packages")
+            .child("seeds")
+            .child("pyproject.toml")
+            .write_str(
+                r#"
+            [project]
+            name = "seeds"
+            version = "1.0.0"
+            requires-python = ">=3.12"
+            dependencies = ["idna==3.6"]
+
+            [tool.uv.workspace]
+            members = ["nested_packages/*"]
+            "#,
+            )?;
+
+        // Create an included package (`seeds2`).
+        root.child("packages")
+            .child("seeds2")
+            .child("pyproject.toml")
+            .write_str(
+                r#"
+            [project]
+            name = "seeds"
+            version = "1.0.0"
+            requires-python = ">=3.12"
+            dependencies = ["idna==3.6"]
+
+            [tool.uv.workspace]
+            members = ["nested_packages/*"]
+            "#,
+            )?;
+
+        let (error, root_escaped) = temporary_test(root.as_ref()).await.unwrap_err();
+        let filters = vec![(root_escaped.as_str(), "[ROOT]")];
+        insta::with_settings!({filters => filters}, {
+            assert_snapshot!(
+                error,
+            @"Two workspace members are both named: `seeds`: `[ROOT]/packages/seeds` and `[ROOT]/packages/seeds2`");
         });
 
         Ok(())

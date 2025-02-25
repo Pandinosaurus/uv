@@ -5,8 +5,13 @@ expression: result
 Ok(
     Lock {
         version: 1,
+        revision: 0,
         fork_markers: [],
+        conflicts: Conflicts(
+            [],
+        ),
         supported_environments: [],
+        required_environments: [],
         requires_python: RequiresPython {
             specifiers: VersionSpecifiers(
                 [
@@ -30,6 +35,7 @@ Ok(
         options: ResolverOptions {
             resolution_mode: Highest,
             prerelease_mode: IfNecessaryOrExplicit,
+            fork_strategy: RequiresPython,
             exclude_newer: None,
         },
         packages: [
@@ -38,7 +44,9 @@ Ok(
                     name: PackageName(
                         "a",
                     ),
-                    version: "0.1.0",
+                    version: Some(
+                        "0.1.0",
+                    ),
                     source: Registry(
                         Url(
                             UrlString(
@@ -71,10 +79,11 @@ Ok(
                 fork_markers: [],
                 dependencies: [],
                 optional_dependencies: {},
-                dev_dependencies: {},
+                dependency_groups: {},
                 metadata: PackageMetadata {
                     requires_dist: {},
-                    requires_dev: {},
+                    provides_extras: [],
+                    dependency_groups: {},
                 },
             },
             Package {
@@ -82,7 +91,9 @@ Ok(
                     name: PackageName(
                         "b",
                     ),
-                    version: "0.1.0",
+                    version: Some(
+                        "0.1.0",
+                    ),
                     source: Registry(
                         Url(
                             UrlString(
@@ -119,7 +130,9 @@ Ok(
                             name: PackageName(
                                 "a",
                             ),
-                            version: "0.1.0",
+                            version: Some(
+                                "0.1.0",
+                            ),
                             source: Registry(
                                 Url(
                                     UrlString(
@@ -136,10 +149,11 @@ Ok(
                     },
                 ],
                 optional_dependencies: {},
-                dev_dependencies: {},
+                dependency_groups: {},
                 metadata: PackageMetadata {
                     requires_dist: {},
-                    requires_dev: {},
+                    provides_extras: [],
+                    dependency_groups: {},
                 },
             },
         ],
@@ -148,7 +162,9 @@ Ok(
                 name: PackageName(
                     "a",
                 ),
-                version: "0.1.0",
+                version: Some(
+                    "0.1.0",
+                ),
                 source: Registry(
                     Url(
                         UrlString(
@@ -161,7 +177,9 @@ Ok(
                 name: PackageName(
                     "b",
                 ),
-                version: "0.1.0",
+                version: Some(
+                    "0.1.0",
+                ),
                 source: Registry(
                     Url(
                         UrlString(
@@ -174,6 +192,7 @@ Ok(
         manifest: ResolverManifest {
             members: {},
             requirements: {},
+            dependency_groups: {},
             constraints: {},
             overrides: {},
             dependency_metadata: {},

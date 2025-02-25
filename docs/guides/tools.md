@@ -1,3 +1,10 @@
+---
+title: Using tools
+description:
+  A guide to using uv to run tools published as Python packages, including one-off invocations with
+  uvx, requesting specific tool versions, installing tools, upgrading tools, and more.
+---
+
 # Using tools
 
 Many Python packages provide applications that can be used as tools. uv has specialized support for
@@ -43,7 +50,7 @@ Tools are installed into temporary, isolated environments when using `uvx`.
 
 !!! note
 
-    If you are running a tool in a [_project_](../concepts/projects.md) and the tool requires that
+    If you are running a tool in a [_project_](../concepts/projects/index.md) and the tool requires that
     your project is installed, e.g., when using `pytest` or `mypy`, you'll want to use
     [`uv run`](./projects.md#running-commands) instead of `uvx`. Otherwise, the tool will be run in
     a virtual environment that is isolated from your project.
@@ -93,6 +100,20 @@ $ uvx --from 'ruff>0.2.0,<0.3.0' ruff check
 
 Note the `@` syntax cannot be used for anything other than an exact version.
 
+## Requesting extras
+
+The `--from` option can be used to run a tool with extras:
+
+```console
+$ uvx --from 'mypy[faster-cache,reports]' mypy --xml-report mypy_report
+```
+
+This can also be combined with version selection:
+
+```console
+$ uvx --from 'mypy[faster-cache,reports]==1.13.0' mypy --xml-report mypy_report
+```
+
 ## Requesting different sources
 
 The `--from` option can also be used to install from alternative sources.
@@ -101,6 +122,24 @@ For example, to pull from git:
 
 ```console
 $ uvx --from git+https://github.com/httpie/cli httpie
+```
+
+You can also pull the latest commit from a specific named branch:
+
+```console
+$ uvx --from git+https://github.com/httpie/cli@master httpie
+```
+
+Or pull a specific tag:
+
+```console
+$ uvx --from git+https://github.com/httpie/cli@3.2.4 httpie
+```
+
+Or even a specific commit:
+
+```console
+$ uvx --from git+https://github.com/httpie/cli@2843b87 httpie
 ```
 
 ## Commands with plugins
@@ -198,9 +237,36 @@ To instead upgrade all tools:
 $ uv tool upgrade --all
 ```
 
+## Requesting Python versions
+
+By default, uv will use your default Python interpreter (the first it finds) when when running,
+installing, or upgrading tools. You can specify the Python interpreter to use with the `--python`
+option.
+
+For example, to request a specific Python version when running a tool:
+
+```console
+$ uvx --python 3.10 ruff
+```
+
+Or, when installing a tool:
+
+```console
+$ uv tool install --python 3.10 ruff
+```
+
+Or, when upgrading a tool:
+
+```console
+$ uv tool upgrade --python 3.10 ruff
+```
+
+For more details on requesting Python versions, see the
+[Python version](../concepts/python-versions.md#requesting-a-version) concept page..
+
 ## Next steps
 
 To learn more about managing tools with uv, see the [Tools concept](../concepts/tools.md) page and
 the [command reference](../reference/cli.md#uv-tool).
 
-Or, read on to learn how to to [work on projects](./projects.md).
+Or, read on to learn how to [work on projects](./projects.md).

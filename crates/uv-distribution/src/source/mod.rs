@@ -1,41 +1,56 @@
 //! Fetch and build source distributions from remote sources.
 
+// This is to squash warnings about `|r| r.into_git_reporter()`. Clippy wants
+// me to eta-reduce that and write it as
+// `<(dyn reporter::Reporter + 'static)>::into_git_reporter`
+// instead. But that's a monster. On the other hand, applying this suppression
+// instruction more granularly is annoying. So we just slap it on the module
+// for now. ---AG
+#![allow(clippy::redundant_closure_for_method_calls)]
+
 use std::borrow::Cow;
-use std::path::{Path, PathBuf};
+use std::ops::Bound;
+use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::distribution_database::ManagedClient;
-use crate::error::Error;
-use crate::metadata::{ArchiveMetadata, Metadata};
-use crate::reporter::Facade;
-use crate::source::built_wheel_metadata::BuiltWheelMetadata;
-use crate::source::revision::Revision;
-use crate::{Reporter, RequiresDist};
-use distribution_filename::{SourceDistExtension, WheelFilename};
-use distribution_types::{
-    BuildableSource, DirectorySourceUrl, FileLocation, GitSourceUrl, HashPolicy, Hashed,
-    PathSourceUrl, RemoteSource, SourceDist, SourceUrl,
-};
 use fs_err::tokio as fs;
 use futures::{FutureExt, TryStreamExt};
-use platform_tags::Tags;
-use pypi_types::{HashDigest, Metadata12, Metadata23, RequiresTxt};
-use reqwest::Response;
+use reqwest::{Response, StatusCode};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
-use tracing::{debug, info_span, instrument, Instrument};
+use tracing::{debug, info_span, instrument, warn, Instrument};
 use url::Url;
+use zip::ZipArchive;
+
 use uv_cache::{Cache, CacheBucket, CacheEntry, CacheShard, Removal, WheelCache};
 use uv_cache_info::CacheInfo;
+use uv_cache_key::cache_digest;
 use uv_client::{
     CacheControl, CachedClientError, Connectivity, DataWithCachePolicy, RegistryClient,
 };
-use uv_configuration::{BuildKind, BuildOutput};
+use uv_configuration::{BuildKind, BuildOutput, SourceStrategy};
+use uv_distribution_filename::{SourceDistExtension, WheelFilename};
+use uv_distribution_types::{
+    BuildableSource, DirectorySourceUrl, FileLocation, GitSourceUrl, HashPolicy, Hashed,
+    PathSourceUrl, SourceDist, SourceUrl,
+};
 use uv_extract::hash::Hasher;
-use uv_fs::{rename_with_retry, write_atomic, LockedFile};
+use uv_fs::{rename_with_retry, write_atomic};
+use uv_git_types::{GitHubRepository, GitOid};
 use uv_metadata::read_archive_metadata;
-use uv_types::{BuildContext, SourceBuildTrait};
-use zip::ZipArchive;
+use uv_normalize::PackageName;
+use uv_pep440::{release_specifiers_to_ranges, Version};
+use uv_platform_tags::Tags;
+use uv_pypi_types::{HashAlgorithm, HashDigest, HashDigests, PyProjectToml, ResolutionMetadata};
+use uv_types::{BuildContext, BuildStack, SourceBuildTrait};
+use uv_workspace::pyproject::ToolUvSources;
+
+use crate::distribution_database::ManagedClient;
+use crate::error::Error;
+use crate::metadata::{ArchiveMetadata, GitWorkspaceMember, Metadata};
+use crate::source::built_wheel_metadata::BuiltWheelMetadata;
+use crate::source::revision::Revision;
+use crate::{Reporter, RequiresDist};
 
 mod built_wheel_metadata;
 mod revision;
@@ -43,6 +58,7 @@ mod revision;
 /// Fetch and build a source distribution from a remote source, or from a local cache.
 pub(crate) struct SourceDistributionBuilder<'a, T: BuildContext> {
     build_context: &'a T,
+    build_stack: Option<&'a BuildStack>,
     reporter: Option<Arc<dyn Reporter>>,
 }
 
@@ -55,16 +71,29 @@ pub(crate) const LOCAL_REVISION: &str = "revision.rev";
 /// The name of the file that contains the cached distribution metadata, encoded via `MsgPack`.
 pub(crate) const METADATA: &str = "metadata.msgpack";
 
+/// The directory within each entry under which to store the unpacked source distribution.
+pub(crate) const SOURCE: &str = "src";
+
 impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
     /// Initialize a [`SourceDistributionBuilder`] from a [`BuildContext`].
     pub(crate) fn new(build_context: &'a T) -> Self {
         Self {
             build_context,
+            build_stack: None,
             reporter: None,
         }
     }
 
-    /// Set the [`Reporter`] to use for this source distribution fetcher.
+    /// Set the [`BuildStack`] to use for the [`SourceDistributionBuilder`].
+    #[must_use]
+    pub(crate) fn with_build_stack(self, build_stack: &'a BuildStack) -> Self {
+        Self {
+            build_stack: Some(build_stack),
+            ..self
+        }
+    }
+
+    /// Set the [`Reporter`] to use for the [`SourceDistributionBuilder`].
     #[must_use]
     pub(crate) fn with_reporter(self, reporter: Arc<dyn Reporter>) -> Self {
         Self {
@@ -94,9 +123,9 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
 
                 let url = match &dist.file.url {
                     FileLocation::RelativeUrl(base, url) => {
-                        pypi_types::base_url_join_relative(base, url)?
+                        uv_pypi_types::base_url_join_relative(base, url)?
                     }
-                    FileLocation::AbsoluteUrl(url) => url.to_url(),
+                    FileLocation::AbsoluteUrl(url) => url.to_url()?,
                 };
 
                 // If the URL is a file URL, use the local path directly.
@@ -122,7 +151,6 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
 
                 self.url(
                     source,
-                    &dist.file.filename,
                     &url,
                     &cache_shard,
                     None,
@@ -135,8 +163,6 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
                 .await?
             }
             BuildableSource::Dist(SourceDist::DirectUrl(dist)) => {
-                let filename = dist.filename().expect("Distribution must have a filename");
-
                 // For direct URLs, cache directly under the hash of the URL itself.
                 let cache_shard = self.build_context.cache().shard(
                     CacheBucket::SourceDistributions,
@@ -145,7 +171,6 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
 
                 self.url(
                     source,
-                    &filename,
                     &dist.url,
                     &cache_shard,
                     dist.subdirectory.as_deref(),
@@ -183,11 +208,6 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
                 .await?
             }
             BuildableSource::Url(SourceUrl::Direct(resource)) => {
-                let filename = resource
-                    .url
-                    .filename()
-                    .expect("Distribution must have a filename");
-
                 // For direct URLs, cache directly under the hash of the URL itself.
                 let cache_shard = self.build_context.cache().shard(
                     CacheBucket::SourceDistributions,
@@ -196,7 +216,6 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
 
                 self.url(
                     source,
-                    &filename,
                     resource.url,
                     &cache_shard,
                     resource.subdirectory,
@@ -253,9 +272,9 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
 
                 let url = match &dist.file.url {
                     FileLocation::RelativeUrl(base, url) => {
-                        pypi_types::base_url_join_relative(base, url)?
+                        uv_pypi_types::base_url_join_relative(base, url)?
                     }
-                    FileLocation::AbsoluteUrl(url) => url.to_url(),
+                    FileLocation::AbsoluteUrl(url) => url.to_url()?,
                 };
 
                 // If the URL is a file URL, use the local path directly.
@@ -278,22 +297,11 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
                         .await;
                 }
 
-                self.url_metadata(
-                    source,
-                    &dist.file.filename,
-                    &url,
-                    &cache_shard,
-                    None,
-                    dist.ext,
-                    hashes,
-                    client,
-                )
-                .boxed_local()
-                .await?
+                self.url_metadata(source, &url, &cache_shard, None, dist.ext, hashes, client)
+                    .boxed_local()
+                    .await?
             }
             BuildableSource::Dist(SourceDist::DirectUrl(dist)) => {
-                let filename = dist.filename().expect("Distribution must have a filename");
-
                 // For direct URLs, cache directly under the hash of the URL itself.
                 let cache_shard = self.build_context.cache().shard(
                     CacheBucket::SourceDistributions,
@@ -302,7 +310,6 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
 
                 self.url_metadata(
                     source,
-                    &filename,
                     &dist.url,
                     &cache_shard,
                     dist.subdirectory.as_deref(),
@@ -333,11 +340,6 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
                     .await?
             }
             BuildableSource::Url(SourceUrl::Direct(resource)) => {
-                let filename = resource
-                    .url
-                    .filename()
-                    .expect("Distribution must have a filename");
-
                 // For direct URLs, cache directly under the hash of the URL itself.
                 let cache_shard = self.build_context.cache().shard(
                     CacheBucket::SourceDistributions,
@@ -346,7 +348,6 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
 
                 self.url_metadata(
                     source,
-                    &filename,
                     resource.url,
                     &cache_shard,
                     resource.subdirectory,
@@ -381,23 +382,10 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         Ok(metadata)
     }
 
-    /// Return the [`RequiresDist`] from a `pyproject.toml`, if it can be statically extracted.
-    pub(crate) async fn requires_dist(&self, project_root: &Path) -> Result<RequiresDist, Error> {
-        let requires_dist = read_requires_dist(project_root).await?;
-        let requires_dist = RequiresDist::from_project_maybe_workspace(
-            requires_dist,
-            project_root,
-            self.build_context.sources(),
-        )
-        .await?;
-        Ok(requires_dist)
-    }
-
     /// Build a source distribution from a remote URL.
     async fn url<'data>(
         &self,
         source: &BuildableSource<'data>,
-        filename: &'data str,
         url: &'data Url,
         cache_shard: &CacheShard,
         subdirectory: Option<&'data Path>,
@@ -406,11 +394,11 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         hashes: HashPolicy<'_>,
         client: &ManagedClient<'_>,
     ) -> Result<BuiltWheelMetadata, Error> {
-        let _lock = lock_shard(cache_shard).await?;
+        let _lock = cache_shard.lock().await.map_err(Error::CacheWrite)?;
 
         // Fetch the revision for the source distribution.
         let revision = self
-            .url_revision(source, filename, ext, url, cache_shard, hashes, client)
+            .url_revision(source, ext, url, cache_shard, hashes, client)
             .await?;
 
         // Before running the build, check that the hashes match.
@@ -425,18 +413,47 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         // Scope all operations to the revision. Within the revision, there's no need to check for
         // freshness, since entries have to be fresher than the revision itself.
         let cache_shard = cache_shard.shard(revision.id());
+        let source_dist_entry = cache_shard.entry(SOURCE);
 
         // If there are build settings, we need to scope to a cache shard.
         let config_settings = self.build_context.config_settings();
         let cache_shard = if config_settings.is_empty() {
             cache_shard
         } else {
-            cache_shard.shard(cache_key::cache_digest(config_settings))
+            cache_shard.shard(cache_digest(config_settings))
         };
 
         // If the cache contains a compatible wheel, return it.
-        if let Some(built_wheel) = BuiltWheelMetadata::find_in_cache(tags, &cache_shard) {
+        if let Some(built_wheel) = BuiltWheelMetadata::find_in_cache(tags, &cache_shard)
+            .filter(|built_wheel| built_wheel.matches(source.name(), source.version()))
+        {
             return Ok(built_wheel.with_hashes(revision.into_hashes()));
+        }
+
+        // Otherwise, we need to build a wheel. Before building, ensure that the source is present.
+        let revision = if source_dist_entry.path().is_dir() {
+            revision
+        } else {
+            self.heal_url_revision(
+                source,
+                ext,
+                url,
+                &source_dist_entry,
+                revision,
+                hashes,
+                client,
+            )
+            .await?
+        };
+
+        // Validate that the subdirectory exists.
+        if let Some(subdirectory) = subdirectory {
+            if !source_dist_entry.path().join(subdirectory).is_dir() {
+                return Err(Error::MissingSubdirectory(
+                    url.clone(),
+                    subdirectory.to_path_buf(),
+                ));
+            }
         }
 
         let task = self
@@ -445,9 +462,14 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             .map(|reporter| reporter.on_build_start(source));
 
         // Build the source distribution.
-        let source_dist_entry = cache_shard.entry(filename);
         let (disk_filename, wheel_filename, metadata) = self
-            .build_distribution(source, source_dist_entry.path(), subdirectory, &cache_shard)
+            .build_distribution(
+                source,
+                source_dist_entry.path(),
+                subdirectory,
+                &cache_shard,
+                SourceStrategy::Disabled,
+            )
             .await?;
 
         if let Some(task) = task {
@@ -478,7 +500,6 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
     async fn url_metadata<'data>(
         &self,
         source: &BuildableSource<'data>,
-        filename: &'data str,
         url: &'data Url,
         cache_shard: &CacheShard,
         subdirectory: Option<&'data Path>,
@@ -486,11 +507,11 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         hashes: HashPolicy<'_>,
         client: &ManagedClient<'_>,
     ) -> Result<ArchiveMetadata, Error> {
-        let _lock = lock_shard(cache_shard).await?;
+        let _lock = cache_shard.lock().await.map_err(Error::CacheWrite)?;
 
         // Fetch the revision for the source distribution.
         let revision = self
-            .url_revision(source, filename, ext, url, cache_shard, hashes, client)
+            .url_revision(source, ext, url, cache_shard, hashes, client)
             .await?;
 
         // Before running the build, check that the hashes match.
@@ -505,26 +526,64 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         // Scope all operations to the revision. Within the revision, there's no need to check for
         // freshness, since entries have to be fresher than the revision itself.
         let cache_shard = cache_shard.shard(revision.id());
-        let source_dist_entry = cache_shard.entry(filename);
+        let source_dist_entry = cache_shard.entry(SOURCE);
 
         // If the metadata is static, return it.
-        if let Some(metadata) =
-            Self::read_static_metadata(source, source_dist_entry.path(), subdirectory).await?
-        {
-            return Ok(ArchiveMetadata {
-                metadata: Metadata::from_metadata23(metadata),
-                hashes: revision.into_hashes(),
-            });
-        }
+        let dynamic =
+            match StaticMetadata::read(source, source_dist_entry.path(), subdirectory).await? {
+                StaticMetadata::Some(metadata) => {
+                    return Ok(ArchiveMetadata {
+                        metadata: Metadata::from_metadata23(metadata),
+                        hashes: revision.into_hashes(),
+                    });
+                }
+                StaticMetadata::Dynamic => true,
+                StaticMetadata::None => false,
+            };
 
         // If the cache contains compatible metadata, return it.
         let metadata_entry = cache_shard.entry(METADATA);
-        if let Some(metadata) = read_cached_metadata(&metadata_entry).await? {
-            debug!("Using cached metadata for: {source}");
-            return Ok(ArchiveMetadata {
-                metadata: Metadata::from_metadata23(metadata),
-                hashes: revision.into_hashes(),
-            });
+        match CachedMetadata::read(&metadata_entry).await {
+            Ok(Some(metadata)) => {
+                if metadata.matches(source.name(), source.version()) {
+                    debug!("Using cached metadata for: {source}");
+                    return Ok(ArchiveMetadata {
+                        metadata: Metadata::from_metadata23(metadata.into()),
+                        hashes: revision.into_hashes(),
+                    });
+                }
+                debug!("Cached metadata does not match expected name and version for: {source}");
+            }
+            Ok(None) => {}
+            Err(err) => {
+                debug!("Failed to deserialize cached metadata for: {source} ({err})");
+            }
+        }
+
+        // Otherwise, we need a wheel.
+        let revision = if source_dist_entry.path().is_dir() {
+            revision
+        } else {
+            self.heal_url_revision(
+                source,
+                ext,
+                url,
+                &source_dist_entry,
+                revision,
+                hashes,
+                client,
+            )
+            .await?
+        };
+
+        // Validate that the subdirectory exists.
+        if let Some(subdirectory) = subdirectory {
+            if !source_dist_entry.path().join(subdirectory).is_dir() {
+                return Err(Error::MissingSubdirectory(
+                    url.clone(),
+                    subdirectory.to_path_buf(),
+                ));
+            }
         }
 
         // If there are build settings, we need to scope to a cache shard.
@@ -532,16 +591,31 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         let cache_shard = if config_settings.is_empty() {
             cache_shard
         } else {
-            cache_shard.shard(cache_key::cache_digest(config_settings))
+            cache_shard.shard(cache_digest(config_settings))
         };
 
         // Otherwise, we either need to build the metadata.
         // If the backend supports `prepare_metadata_for_build_wheel`, use it.
         if let Some(metadata) = self
-            .build_metadata(source, source_dist_entry.path(), subdirectory)
+            .build_metadata(
+                source,
+                source_dist_entry.path(),
+                subdirectory,
+                SourceStrategy::Disabled,
+            )
             .boxed_local()
             .await?
         {
+            // If necessary, mark the metadata as dynamic.
+            let metadata = if dynamic {
+                ResolutionMetadata {
+                    dynamic: true,
+                    ..metadata
+                }
+            } else {
+                metadata
+            };
+
             // Store the metadata.
             fs::create_dir_all(metadata_entry.dir())
                 .await
@@ -563,19 +637,35 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
 
         // Build the source distribution.
         let (_disk_filename, _wheel_filename, metadata) = self
-            .build_distribution(source, source_dist_entry.path(), subdirectory, &cache_shard)
+            .build_distribution(
+                source,
+                source_dist_entry.path(),
+                subdirectory,
+                &cache_shard,
+                SourceStrategy::Disabled,
+            )
             .await?;
-
-        // Store the metadata.
-        write_atomic(metadata_entry.path(), rmp_serde::to_vec(&metadata)?)
-            .await
-            .map_err(Error::CacheWrite)?;
 
         if let Some(task) = task {
             if let Some(reporter) = self.reporter.as_ref() {
                 reporter.on_build_complete(source, task);
             }
         }
+
+        // If necessary, mark the metadata as dynamic.
+        let metadata = if dynamic {
+            ResolutionMetadata {
+                dynamic: true,
+                ..metadata
+            }
+        } else {
+            metadata
+        };
+
+        // Store the metadata.
+        write_atomic(metadata_entry.path(), rmp_serde::to_vec(&metadata)?)
+            .await
+            .map_err(Error::CacheWrite)?;
 
         Ok(ArchiveMetadata {
             metadata: Metadata::from_metadata23(metadata),
@@ -587,7 +677,6 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
     async fn url_revision(
         &self,
         source: &BuildableSource<'_>,
-        filename: &str,
         ext: SourceDistExtension,
         url: &Url,
         cache_shard: &CacheShard,
@@ -613,12 +702,13 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
 
                 // Download the source distribution.
                 debug!("Downloading source distribution: {source}");
-                let entry = cache_shard.shard(revision.id()).entry(filename);
+                let entry = cache_shard.shard(revision.id()).entry(SOURCE);
+                let algorithms = hashes.algorithms();
                 let hashes = self
-                    .download_archive(response, source, filename, ext, entry.path(), hashes)
+                    .download_archive(response, source, ext, entry.path(), &algorithms)
                     .await?;
 
-                Ok(revision.with_hashes(hashes))
+                Ok(revision.with_hashes(HashDigests::from(hashes)))
             }
             .boxed_local()
             .instrument(info_span!("download", source_dist = %source))
@@ -626,9 +716,12 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         let req = Self::request(url.clone(), client.unmanaged)?;
         let revision = client
             .managed(|client| {
-                client
-                    .cached_client()
-                    .get_serde(req, &cache_entry, cache_control, download)
+                client.cached_client().get_serde_with_retry(
+                    req,
+                    &cache_entry,
+                    cache_control,
+                    download,
+                )
             })
             .await
             .map_err(|err| match err {
@@ -644,7 +737,11 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
                 .managed(|client| async move {
                     client
                         .cached_client()
-                        .skip_cache(Self::request(url.clone(), client)?, &cache_entry, download)
+                        .skip_cache_with_retry(
+                            Self::request(url.clone(), client)?,
+                            &cache_entry,
+                            download,
+                        )
                         .await
                         .map_err(|err| match err {
                             CachedClientError::Callback(err) => err,
@@ -664,7 +761,7 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         tags: &Tags,
         hashes: HashPolicy<'_>,
     ) -> Result<BuiltWheelMetadata, Error> {
-        let _lock = lock_shard(cache_shard).await?;
+        let _lock = cache_shard.lock().await.map_err(Error::CacheWrite)?;
 
         // Fetch the revision for the source distribution.
         let LocalRevisionPointer {
@@ -686,30 +783,44 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         // Scope all operations to the revision. Within the revision, there's no need to check for
         // freshness, since entries have to be fresher than the revision itself.
         let cache_shard = cache_shard.shard(revision.id());
+        let source_entry = cache_shard.entry(SOURCE);
 
         // If there are build settings, we need to scope to a cache shard.
         let config_settings = self.build_context.config_settings();
         let cache_shard = if config_settings.is_empty() {
             cache_shard
         } else {
-            cache_shard.shard(cache_key::cache_digest(config_settings))
+            cache_shard.shard(cache_digest(config_settings))
         };
 
         // If the cache contains a compatible wheel, return it.
-        if let Some(built_wheel) = BuiltWheelMetadata::find_in_cache(tags, &cache_shard) {
+        if let Some(built_wheel) = BuiltWheelMetadata::find_in_cache(tags, &cache_shard)
+            .filter(|built_wheel| built_wheel.matches(source.name(), source.version()))
+        {
             return Ok(built_wheel);
         }
 
-        let source_entry = cache_shard.entry("source");
+        // Otherwise, we need to build a wheel, which requires a source distribution.
+        let revision = if source_entry.path().is_dir() {
+            revision
+        } else {
+            self.heal_archive_revision(source, resource, &source_entry, revision, hashes)
+                .await?
+        };
 
-        // Otherwise, we need to build a wheel.
         let task = self
             .reporter
             .as_ref()
             .map(|reporter| reporter.on_build_start(source));
 
         let (disk_filename, filename, metadata) = self
-            .build_distribution(source, source_entry.path(), None, &cache_shard)
+            .build_distribution(
+                source,
+                source_entry.path(),
+                None,
+                &cache_shard,
+                SourceStrategy::Disabled,
+            )
             .await?;
 
         if let Some(task) = task {
@@ -744,7 +855,7 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         cache_shard: &CacheShard,
         hashes: HashPolicy<'_>,
     ) -> Result<ArchiveMetadata, Error> {
-        let _lock = lock_shard(cache_shard).await?;
+        let _lock = cache_shard.lock().await.map_err(Error::CacheWrite)?;
 
         // Fetch the revision for the source distribution.
         let LocalRevisionPointer { revision, .. } = self
@@ -763,34 +874,63 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         // Scope all operations to the revision. Within the revision, there's no need to check for
         // freshness, since entries have to be fresher than the revision itself.
         let cache_shard = cache_shard.shard(revision.id());
-        let source_entry = cache_shard.entry("source");
+        let source_entry = cache_shard.entry(SOURCE);
 
         // If the metadata is static, return it.
-        if let Some(metadata) =
-            Self::read_static_metadata(source, source_entry.path(), None).await?
-        {
-            return Ok(ArchiveMetadata {
-                metadata: Metadata::from_metadata23(metadata),
-                hashes: revision.into_hashes(),
-            });
-        }
+        let dynamic = match StaticMetadata::read(source, source_entry.path(), None).await? {
+            StaticMetadata::Some(metadata) => {
+                return Ok(ArchiveMetadata {
+                    metadata: Metadata::from_metadata23(metadata),
+                    hashes: revision.into_hashes(),
+                });
+            }
+            StaticMetadata::Dynamic => true,
+            StaticMetadata::None => false,
+        };
 
         // If the cache contains compatible metadata, return it.
         let metadata_entry = cache_shard.entry(METADATA);
-        if let Some(metadata) = read_cached_metadata(&metadata_entry).await? {
-            debug!("Using cached metadata for: {source}");
-            return Ok(ArchiveMetadata {
-                metadata: Metadata::from_metadata23(metadata),
-                hashes: revision.into_hashes(),
-            });
+        match CachedMetadata::read(&metadata_entry).await {
+            Ok(Some(metadata)) => {
+                if metadata.matches(source.name(), source.version()) {
+                    debug!("Using cached metadata for: {source}");
+                    return Ok(ArchiveMetadata {
+                        metadata: Metadata::from_metadata23(metadata.into()),
+                        hashes: revision.into_hashes(),
+                    });
+                }
+                debug!("Cached metadata does not match expected name and version for: {source}");
+            }
+            Ok(None) => {}
+            Err(err) => {
+                debug!("Failed to deserialize cached metadata for: {source} ({err})");
+            }
         }
+
+        // Otherwise, we need a source distribution.
+        let revision = if source_entry.path().is_dir() {
+            revision
+        } else {
+            self.heal_archive_revision(source, resource, &source_entry, revision, hashes)
+                .await?
+        };
 
         // If the backend supports `prepare_metadata_for_build_wheel`, use it.
         if let Some(metadata) = self
-            .build_metadata(source, source_entry.path(), None)
+            .build_metadata(source, source_entry.path(), None, SourceStrategy::Disabled)
             .boxed_local()
             .await?
         {
+            // If necessary, mark the metadata as dynamic.
+            let metadata = if dynamic {
+                ResolutionMetadata {
+                    dynamic: true,
+                    ..metadata
+                }
+            } else {
+                metadata
+            };
+
             // Store the metadata.
             fs::create_dir_all(metadata_entry.dir())
                 .await
@@ -810,7 +950,7 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         let cache_shard = if config_settings.is_empty() {
             cache_shard
         } else {
-            cache_shard.shard(cache_key::cache_digest(config_settings))
+            cache_shard.shard(cache_digest(config_settings))
         };
 
         // Otherwise, we need to build a wheel.
@@ -820,7 +960,13 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             .map(|reporter| reporter.on_build_start(source));
 
         let (_disk_filename, _filename, metadata) = self
-            .build_distribution(source, source_entry.path(), None, &cache_shard)
+            .build_distribution(
+                source,
+                source_entry.path(),
+                None,
+                &cache_shard,
+                SourceStrategy::Disabled,
+            )
             .await?;
 
         if let Some(task) = task {
@@ -828,6 +974,16 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
                 reporter.on_build_complete(source, task);
             }
         }
+
+        // If necessary, mark the metadata as dynamic.
+        let metadata = if dynamic {
+            ResolutionMetadata {
+                dynamic: true,
+                ..metadata
+            }
+        } else {
+            metadata
+        };
 
         // Store the metadata.
         write_atomic(metadata_entry.path(), rmp_serde::to_vec(&metadata)?)
@@ -874,13 +1030,14 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
 
         // Unzip the archive to a temporary directory.
         debug!("Unpacking source distribution: {source}");
-        let entry = cache_shard.shard(revision.id()).entry("source");
+        let entry = cache_shard.shard(revision.id()).entry(SOURCE);
+        let algorithms = hashes.algorithms();
         let hashes = self
-            .persist_archive(&resource.path, resource.ext, entry.path(), hashes)
+            .persist_archive(&resource.path, resource.ext, entry.path(), &algorithms)
             .await?;
 
         // Include the hashes and cache info in the revision.
-        let revision = revision.with_hashes(hashes);
+        let revision = revision.with_hashes(HashDigests::from(hashes));
 
         // Persist the revision.
         let pointer = LocalRevisionPointer {
@@ -915,7 +1072,8 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             },
         );
 
-        let _lock = lock_shard(&cache_shard).await?;
+        // Acquire the advisory lock.
+        let _lock = cache_shard.lock().await.map_err(Error::CacheWrite)?;
 
         // Fetch the revision for the source distribution.
         let LocalRevisionPointer {
@@ -934,11 +1092,13 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         let cache_shard = if config_settings.is_empty() {
             cache_shard
         } else {
-            cache_shard.shard(cache_key::cache_digest(config_settings))
+            cache_shard.shard(cache_digest(config_settings))
         };
 
         // If the cache contains a compatible wheel, return it.
-        if let Some(built_wheel) = BuiltWheelMetadata::find_in_cache(tags, &cache_shard) {
+        if let Some(built_wheel) = BuiltWheelMetadata::find_in_cache(tags, &cache_shard)
+            .filter(|built_wheel| built_wheel.matches(source.name(), source.version()))
+        {
             return Ok(built_wheel);
         }
 
@@ -949,7 +1109,13 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             .map(|reporter| reporter.on_build_start(source));
 
         let (disk_filename, filename, metadata) = self
-            .build_distribution(source, &resource.install_path, None, &cache_shard)
+            .build_distribution(
+                source,
+                &resource.install_path,
+                None,
+                &cache_shard,
+                self.build_context.sources(),
+            )
             .await?;
 
         if let Some(task) = task {
@@ -989,18 +1155,23 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             return Err(Error::HashesNotSupportedSourceTree(source.to_string()));
         }
 
-        if let Some(metadata) =
-            Self::read_static_metadata(source, &resource.install_path, None).await?
-        {
-            return Ok(ArchiveMetadata::from(
-                Metadata::from_workspace(
-                    metadata,
-                    resource.install_path.as_ref(),
-                    self.build_context.sources(),
-                )
-                .await?,
-            ));
-        }
+        // If the metadata is static, return it.
+        let dynamic = match StaticMetadata::read(source, &resource.install_path, None).await? {
+            StaticMetadata::Some(metadata) => {
+                return Ok(ArchiveMetadata::from(
+                    Metadata::from_workspace(
+                        metadata,
+                        resource.install_path.as_ref(),
+                        None,
+                        self.build_context.locations(),
+                        self.build_context.sources(),
+                    )
+                    .await?,
+                ));
+            }
+            StaticMetadata::Dynamic => true,
+            StaticMetadata::None => false,
+        };
 
         let cache_shard = self.build_context.cache().shard(
             CacheBucket::SourceDistributions,
@@ -1011,7 +1182,8 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             },
         );
 
-        let _lock = lock_shard(&cache_shard).await?;
+        // Acquire the advisory lock.
+        let _lock = cache_shard.lock().await.map_err(Error::CacheWrite)?;
 
         // Fetch the revision for the source distribution.
         let LocalRevisionPointer { revision, .. } = self
@@ -1024,21 +1196,47 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
 
         // If the cache contains compatible metadata, return it.
         let metadata_entry = cache_shard.entry(METADATA);
-        if let Some(metadata) = read_cached_metadata(&metadata_entry).await? {
-            debug!("Using cached metadata for: {source}");
-            return Ok(ArchiveMetadata::from(
-                Metadata::from_workspace(
-                    metadata,
-                    resource.install_path.as_ref(),
-                    self.build_context.sources(),
-                )
-                .await?,
-            ));
+        match CachedMetadata::read(&metadata_entry).await {
+            Ok(Some(metadata)) => {
+                if metadata.matches(source.name(), source.version()) {
+                    debug!("Using cached metadata for: {source}");
+
+                    // If necessary, mark the metadata as dynamic.
+                    let metadata = if dynamic {
+                        ResolutionMetadata {
+                            dynamic: true,
+                            ..metadata.into()
+                        }
+                    } else {
+                        metadata.into()
+                    };
+                    return Ok(ArchiveMetadata::from(
+                        Metadata::from_workspace(
+                            metadata,
+                            resource.install_path.as_ref(),
+                            None,
+                            self.build_context.locations(),
+                            self.build_context.sources(),
+                        )
+                        .await?,
+                    ));
+                }
+                debug!("Cached metadata does not match expected name and version for: {source}");
+            }
+            Ok(None) => {}
+            Err(err) => {
+                debug!("Failed to deserialize cached metadata for: {source} ({err})");
+            }
         }
 
         // If the backend supports `prepare_metadata_for_build_wheel`, use it.
         if let Some(metadata) = self
-            .build_metadata(source, &resource.install_path, None)
+            .build_metadata(
+                source,
+                &resource.install_path,
+                None,
+                self.build_context.sources(),
+            )
             .boxed_local()
             .await?
         {
@@ -1050,10 +1248,22 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
                 .await
                 .map_err(Error::CacheWrite)?;
 
+            // If necessary, mark the metadata as dynamic.
+            let metadata = if dynamic {
+                ResolutionMetadata {
+                    dynamic: true,
+                    ..metadata
+                }
+            } else {
+                metadata
+            };
+
             return Ok(ArchiveMetadata::from(
                 Metadata::from_workspace(
                     metadata,
                     resource.install_path.as_ref(),
+                    None,
+                    self.build_context.locations(),
                     self.build_context.sources(),
                 )
                 .await?,
@@ -1065,7 +1275,7 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         let cache_shard = if config_settings.is_empty() {
             cache_shard
         } else {
-            cache_shard.shard(cache_key::cache_digest(config_settings))
+            cache_shard.shard(cache_digest(config_settings))
         };
 
         // Otherwise, we need to build a wheel.
@@ -1075,7 +1285,13 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             .map(|reporter| reporter.on_build_start(source));
 
         let (_disk_filename, _filename, metadata) = self
-            .build_distribution(source, &resource.install_path, None, &cache_shard)
+            .build_distribution(
+                source,
+                &resource.install_path,
+                None,
+                &cache_shard,
+                self.build_context.sources(),
+            )
             .await?;
 
         if let Some(task) = task {
@@ -1089,10 +1305,22 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             .await
             .map_err(Error::CacheWrite)?;
 
+        // If necessary, mark the metadata as dynamic.
+        let metadata = if dynamic {
+            ResolutionMetadata {
+                dynamic: true,
+                ..metadata
+            }
+        } else {
+            metadata
+        };
+
         Ok(ArchiveMetadata::from(
             Metadata::from_workspace(
                 metadata,
                 resource.install_path.as_ref(),
+                None,
+                self.build_context.locations(),
                 self.build_context.sources(),
             )
             .await?,
@@ -1143,6 +1371,47 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         Ok(pointer)
     }
 
+    /// Return the [`RequiresDist`] from a `pyproject.toml`, if it can be statically extracted.
+    pub(crate) async fn source_tree_requires_dist(
+        &self,
+        source_tree: &Path,
+    ) -> Result<Option<RequiresDist>, Error> {
+        // Attempt to read static metadata from the `pyproject.toml`.
+        match read_requires_dist(source_tree).await {
+            Ok(requires_dist) => {
+                debug!(
+                    "Found static `requires-dist` for: {}",
+                    source_tree.display()
+                );
+                let requires_dist = RequiresDist::from_project_maybe_workspace(
+                    requires_dist,
+                    source_tree,
+                    None,
+                    self.build_context.locations(),
+                    self.build_context.sources(),
+                )
+                .await?;
+                Ok(Some(requires_dist))
+            }
+            Err(
+                err @ (Error::MissingPyprojectToml
+                | Error::PyprojectToml(
+                    uv_pypi_types::MetadataError::Pep508Error(_)
+                    | uv_pypi_types::MetadataError::DynamicField(_)
+                    | uv_pypi_types::MetadataError::FieldNotFound(_)
+                    | uv_pypi_types::MetadataError::PoetrySyntax,
+                )),
+            ) => {
+                debug!(
+                    "No static `requires-dist` available for: {} ({err:?})",
+                    source_tree.display()
+                );
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Build a source distribution from a Git repository.
     async fn git(
         &self,
@@ -1163,31 +1432,50 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             .git()
             .fetch(
                 resource.git,
-                client.unmanaged.uncached_client(resource.url).clone(),
+                client
+                    .unmanaged
+                    .uncached_client(resource.git.repository())
+                    .clone(),
+                client.unmanaged.disable_ssl(resource.git.repository()),
                 self.build_context.cache().bucket(CacheBucket::Git),
-                self.reporter.clone().map(Facade::from),
+                self.reporter
+                    .clone()
+                    .map(|reporter| reporter.into_git_reporter()),
             )
             .await?;
+
+        // Validate that the subdirectory exists.
+        if let Some(subdirectory) = resource.subdirectory {
+            if !fetch.path().join(subdirectory).is_dir() {
+                return Err(Error::MissingSubdirectory(
+                    resource.url.to_url(),
+                    subdirectory.to_path_buf(),
+                ));
+            }
+        }
 
         let git_sha = fetch.git().precise().expect("Exact commit after checkout");
         let cache_shard = self.build_context.cache().shard(
             CacheBucket::SourceDistributions,
-            WheelCache::Git(resource.url, &git_sha.to_short_string()).root(),
+            WheelCache::Git(resource.url, git_sha.as_short_str()).root(),
         );
         let metadata_entry = cache_shard.entry(METADATA);
 
-        let _lock = lock_shard(&cache_shard).await?;
+        // Acquire the advisory lock.
+        let _lock = cache_shard.lock().await.map_err(Error::CacheWrite)?;
 
         // If there are build settings, we need to scope to a cache shard.
         let config_settings = self.build_context.config_settings();
         let cache_shard = if config_settings.is_empty() {
             cache_shard
         } else {
-            cache_shard.shard(cache_key::cache_digest(config_settings))
+            cache_shard.shard(cache_digest(config_settings))
         };
 
         // If the cache contains a compatible wheel, return it.
-        if let Some(built_wheel) = BuiltWheelMetadata::find_in_cache(tags, &cache_shard) {
+        if let Some(built_wheel) = BuiltWheelMetadata::find_in_cache(tags, &cache_shard)
+            .filter(|built_wheel| built_wheel.matches(source.name(), source.version()))
+        {
             return Ok(built_wheel);
         }
 
@@ -1197,7 +1485,13 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             .map(|reporter| reporter.on_build_start(source));
 
         let (disk_filename, filename, metadata) = self
-            .build_distribution(source, fetch.path(), resource.subdirectory, &cache_shard)
+            .build_distribution(
+                source,
+                fetch.path(),
+                resource.subdirectory,
+                &cache_shard,
+                self.build_context.sources(),
+            )
             .await?;
 
         if let Some(task) = task {
@@ -1215,7 +1509,7 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             path: cache_shard.join(&disk_filename),
             target: cache_shard.join(filename.stem()),
             filename,
-            hashes: vec![],
+            hashes: HashDigests::empty(),
             cache_info: CacheInfo::default(),
         })
     }
@@ -1236,26 +1530,98 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             return Err(Error::HashesNotSupportedGit(source.to_string()));
         }
 
+        // If this is GitHub URL, attempt to resolve to a precise commit using the GitHub API.
+        match self
+            .build_context
+            .git()
+            .github_fast_path(
+                resource.git,
+                client
+                    .unmanaged
+                    .uncached_client(resource.git.repository())
+                    .clone(),
+            )
+            .await
+        {
+            Ok(Some(precise)) => {
+                // There's no need to check the cache, since we can't use cached metadata if there are
+                // sources, and we can't know if there are sources without fetching the
+                // `pyproject.toml`.
+                //
+                // For the same reason, there's no need to write to the cache, since we won't be able to
+                // use it on subsequent runs.
+                match self
+                    .github_metadata(precise, source, resource, client)
+                    .await
+                {
+                    Ok(Some(metadata)) => {
+                        // Validate the metadata, but ignore it if the metadata doesn't match.
+                        match validate_metadata(source, &metadata) {
+                            Ok(()) => {
+                                debug!("Found static metadata via GitHub fast path for: {source}");
+                                return Ok(ArchiveMetadata {
+                                    metadata: Metadata::from_metadata23(metadata),
+                                    hashes: HashDigests::empty(),
+                                });
+                            }
+                            Err(err) => {
+                                debug!("Ignoring `pyproject.toml` from GitHub for {source}: {err}");
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        // Nothing to do.
+                    }
+                    Err(err) => {
+                        debug!("Failed to fetch `pyproject.toml` via GitHub fast path for: {source} ({err})");
+                    }
+                }
+            }
+            Ok(None) => {
+                // Nothing to do.
+            }
+            Err(err) => {
+                debug!("Failed to resolve commit via GitHub fast path for: {source} ({err})");
+            }
+        }
+
         // Fetch the Git repository.
         let fetch = self
             .build_context
             .git()
             .fetch(
                 resource.git,
-                client.unmanaged.uncached_client(resource.url).clone(),
+                client
+                    .unmanaged
+                    .uncached_client(resource.git.repository())
+                    .clone(),
+                client.unmanaged.disable_ssl(resource.git.repository()),
                 self.build_context.cache().bucket(CacheBucket::Git),
-                self.reporter.clone().map(Facade::from),
+                self.reporter
+                    .clone()
+                    .map(|reporter| reporter.into_git_reporter()),
             )
             .await?;
+
+        // Validate that the subdirectory exists.
+        if let Some(subdirectory) = resource.subdirectory {
+            if !fetch.path().join(subdirectory).is_dir() {
+                return Err(Error::MissingSubdirectory(
+                    resource.url.to_url(),
+                    subdirectory.to_path_buf(),
+                ));
+            }
+        }
 
         let git_sha = fetch.git().precise().expect("Exact commit after checkout");
         let cache_shard = self.build_context.cache().shard(
             CacheBucket::SourceDistributions,
-            WheelCache::Git(resource.url, &git_sha.to_short_string()).root(),
+            WheelCache::Git(resource.url, git_sha.as_short_str()).root(),
         );
         let metadata_entry = cache_shard.entry(METADATA);
 
-        let _lock = lock_shard(&cache_shard).await?;
+        // Acquire the advisory lock.
+        let _lock = cache_shard.lock().await.map_err(Error::CacheWrite)?;
 
         let path = if let Some(subdirectory) = resource.subdirectory {
             Cow::Owned(fetch.path().join(subdirectory))
@@ -1263,13 +1629,29 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             Cow::Borrowed(fetch.path())
         };
 
-        if let Some(metadata) =
-            Self::read_static_metadata(source, fetch.path(), resource.subdirectory).await?
-        {
-            return Ok(ArchiveMetadata::from(
-                Metadata::from_workspace(metadata, &path, self.build_context.sources()).await?,
-            ));
-        }
+        let git_member = GitWorkspaceMember {
+            fetch_root: fetch.path(),
+            git_source: resource,
+        };
+
+        // If the metadata is static, return it.
+        let dynamic =
+            match StaticMetadata::read(source, fetch.path(), resource.subdirectory).await? {
+                StaticMetadata::Some(metadata) => {
+                    return Ok(ArchiveMetadata::from(
+                        Metadata::from_workspace(
+                            metadata,
+                            &path,
+                            Some(&git_member),
+                            self.build_context.locations(),
+                            self.build_context.sources(),
+                        )
+                        .await?,
+                    ));
+                }
+                StaticMetadata::Dynamic => true,
+                StaticMetadata::None => false,
+            };
 
         // If the cache contains compatible metadata, return it.
         if self
@@ -1279,26 +1661,58 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             .map_err(Error::CacheRead)?
             .is_fresh()
         {
-            if let Some(metadata) = read_cached_metadata(&metadata_entry).await? {
-                let path = if let Some(subdirectory) = resource.subdirectory {
-                    Cow::Owned(fetch.path().join(subdirectory))
-                } else {
-                    Cow::Borrowed(fetch.path())
-                };
+            match CachedMetadata::read(&metadata_entry).await {
+                Ok(Some(metadata)) => {
+                    if metadata.matches(source.name(), source.version()) {
+                        debug!("Using cached metadata for: {source}");
 
-                debug!("Using cached metadata for: {source}");
-                return Ok(ArchiveMetadata::from(
-                    Metadata::from_workspace(metadata, &path, self.build_context.sources()).await?,
-                ));
+                        let git_member = GitWorkspaceMember {
+                            fetch_root: fetch.path(),
+                            git_source: resource,
+                        };
+                        return Ok(ArchiveMetadata::from(
+                            Metadata::from_workspace(
+                                metadata.into(),
+                                &path,
+                                Some(&git_member),
+                                self.build_context.locations(),
+                                self.build_context.sources(),
+                            )
+                            .await?,
+                        ));
+                    }
+                    debug!(
+                        "Cached metadata does not match expected name and version for: {source}"
+                    );
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    debug!("Failed to deserialize cached metadata for: {source} ({err})");
+                }
             }
         }
 
         // If the backend supports `prepare_metadata_for_build_wheel`, use it.
         if let Some(metadata) = self
-            .build_metadata(source, fetch.path(), resource.subdirectory)
+            .build_metadata(
+                source,
+                fetch.path(),
+                resource.subdirectory,
+                self.build_context.sources(),
+            )
             .boxed_local()
             .await?
         {
+            // If necessary, mark the metadata as dynamic.
+            let metadata = if dynamic {
+                ResolutionMetadata {
+                    dynamic: true,
+                    ..metadata
+                }
+            } else {
+                metadata
+            };
+
             // Store the metadata.
             fs::create_dir_all(metadata_entry.dir())
                 .await
@@ -1308,7 +1722,14 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
                 .map_err(Error::CacheWrite)?;
 
             return Ok(ArchiveMetadata::from(
-                Metadata::from_workspace(metadata, &path, self.build_context.sources()).await?,
+                Metadata::from_workspace(
+                    metadata,
+                    &path,
+                    Some(&git_member),
+                    self.build_context.locations(),
+                    self.build_context.sources(),
+                )
+                .await?,
             ));
         }
 
@@ -1317,7 +1738,7 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         let cache_shard = if config_settings.is_empty() {
             cache_shard
         } else {
-            cache_shard.shard(cache_key::cache_digest(config_settings))
+            cache_shard.shard(cache_digest(config_settings))
         };
 
         // Otherwise, we need to build a wheel.
@@ -1327,7 +1748,13 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             .map(|reporter| reporter.on_build_start(source));
 
         let (_disk_filename, _filename, metadata) = self
-            .build_distribution(source, fetch.path(), resource.subdirectory, &cache_shard)
+            .build_distribution(
+                source,
+                fetch.path(),
+                resource.subdirectory,
+                &cache_shard,
+                self.build_context.sources(),
+            )
             .await?;
 
         if let Some(task) = task {
@@ -1336,14 +1763,275 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             }
         }
 
+        // If necessary, mark the metadata as dynamic.
+        let metadata = if dynamic {
+            ResolutionMetadata {
+                dynamic: true,
+                ..metadata
+            }
+        } else {
+            metadata
+        };
+
         // Store the metadata.
         write_atomic(metadata_entry.path(), rmp_serde::to_vec(&metadata)?)
             .await
             .map_err(Error::CacheWrite)?;
 
         Ok(ArchiveMetadata::from(
-            Metadata::from_workspace(metadata, fetch.path(), self.build_context.sources()).await?,
+            Metadata::from_workspace(
+                metadata,
+                fetch.path(),
+                Some(&git_member),
+                self.build_context.locations(),
+                self.build_context.sources(),
+            )
+            .await?,
         ))
+    }
+
+    /// Resolve a source to a specific revision.
+    pub(crate) async fn resolve_revision(
+        &self,
+        source: &BuildableSource<'_>,
+        client: &ManagedClient<'_>,
+    ) -> Result<(), Error> {
+        let git = match source {
+            BuildableSource::Dist(SourceDist::Git(source)) => &*source.git,
+            BuildableSource::Url(SourceUrl::Git(source)) => source.git,
+            _ => {
+                return Ok(());
+            }
+        };
+
+        // If this is GitHub URL, attempt to resolve to a precise commit using the GitHub API.
+        if self
+            .build_context
+            .git()
+            .github_fast_path(
+                git,
+                client.unmanaged.uncached_client(git.repository()).clone(),
+            )
+            .await?
+            .is_some()
+        {
+            debug!("Resolved to precise commit via GitHub fast path: {source}");
+            return Ok(());
+        }
+
+        // Otherwise, fetch the Git repository.
+        self.build_context
+            .git()
+            .fetch(
+                git,
+                client.unmanaged.uncached_client(git.repository()).clone(),
+                client.unmanaged.disable_ssl(git.repository()),
+                self.build_context.cache().bucket(CacheBucket::Git),
+                self.reporter
+                    .clone()
+                    .map(|reporter| reporter.into_git_reporter()),
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    /// Fetch static [`ResolutionMetadata`] from a GitHub repository, if possible.
+    ///
+    /// Attempts to fetch the `pyproject.toml` from the resolved commit using the GitHub API.
+    async fn github_metadata(
+        &self,
+        commit: GitOid,
+        source: &BuildableSource<'_>,
+        resource: &GitSourceUrl<'_>,
+        client: &ManagedClient<'_>,
+    ) -> Result<Option<ResolutionMetadata>, Error> {
+        let GitSourceUrl {
+            git, subdirectory, ..
+        } = resource;
+
+        // The fast path isn't available for subdirectories. If a `pyproject.toml` is in a
+        // subdirectory, it could be part of a workspace; and if it's part of a workspace, it could
+        // have `tool.uv.sources` entries that it inherits from the workspace root.
+        if subdirectory.is_some() {
+            return Ok(None);
+        }
+
+        let Some(GitHubRepository { owner, repo }) = GitHubRepository::parse(git.repository())
+        else {
+            return Ok(None);
+        };
+
+        // Fetch the `pyproject.toml` from the resolved commit.
+        let url =
+            format!("https://raw.githubusercontent.com/{owner}/{repo}/{commit}/pyproject.toml");
+
+        debug!("Attempting to fetch `pyproject.toml` from: {url}");
+
+        let content = client
+            .managed(|client| async {
+                let response = client
+                    .uncached_client(git.repository())
+                    .get(&url)
+                    .send()
+                    .await?;
+
+                // If the `pyproject.toml` does not exist, the GitHub API will return a 404.
+                if response.status() == StatusCode::NOT_FOUND {
+                    return Ok::<Option<String>, Error>(None);
+                }
+                response.error_for_status_ref()?;
+
+                let content = response.text().await?;
+                Ok::<Option<String>, Error>(Some(content))
+            })
+            .await?;
+
+        let Some(content) = content else {
+            debug!("GitHub API returned a 404 for: {url}");
+            return Ok(None);
+        };
+
+        // Parse the `pyproject.toml`.
+        let pyproject_toml = match PyProjectToml::from_toml(&content) {
+            Ok(metadata) => metadata,
+            Err(
+                uv_pypi_types::MetadataError::InvalidPyprojectTomlSyntax(..)
+                | uv_pypi_types::MetadataError::InvalidPyprojectTomlSchema(..),
+            ) => {
+                debug!("Failed to read `pyproject.toml` from GitHub API for: {url}");
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
+        };
+
+        // Parse the metadata.
+        let metadata =
+            match ResolutionMetadata::parse_pyproject_toml(pyproject_toml, source.version()) {
+                Ok(metadata) => metadata,
+                Err(
+                    uv_pypi_types::MetadataError::Pep508Error(..)
+                    | uv_pypi_types::MetadataError::DynamicField(..)
+                    | uv_pypi_types::MetadataError::FieldNotFound(..)
+                    | uv_pypi_types::MetadataError::PoetrySyntax,
+                ) => {
+                    debug!("Failed to extract static metadata from GitHub API for: {url}");
+                    return Ok(None);
+                }
+                Err(err) => return Err(err.into()),
+            };
+
+        // Determine whether the project has `tool.uv.sources`. If the project has sources, it must
+        // be lowered, which requires access to the workspace. For example, it could have workspace
+        // members that need to be translated to concrete paths on disk.
+        //
+        // TODO(charlie): We could still use the `pyproject.toml` if the sources are all `git` or
+        // `url` sources; this is only applicable to `workspace` and `path` sources. It's awkward,
+        // though, because we'd need to pass a path into the lowering routine, and that path would
+        // be incorrect (we'd just be relying on it not being used).
+        match has_sources(&content) {
+            Ok(false) => {}
+            Ok(true) => {
+                debug!("Skipping GitHub fast path; `pyproject.toml` has sources: {url}");
+                return Ok(None);
+            }
+            Err(err) => {
+                debug!("Failed to parse `tool.uv.sources` from GitHub API for: {url} ({err})");
+                return Ok(None);
+            }
+        }
+
+        Ok(Some(metadata))
+    }
+
+    /// Heal a [`Revision`] for a local archive.
+    async fn heal_archive_revision(
+        &self,
+        source: &BuildableSource<'_>,
+        resource: &PathSourceUrl<'_>,
+        entry: &CacheEntry,
+        revision: Revision,
+        hashes: HashPolicy<'_>,
+    ) -> Result<Revision, Error> {
+        warn!("Re-extracting missing source distribution: {source}");
+
+        // Take the union of the requested and existing hash algorithms.
+        let algorithms = {
+            let mut algorithms = hashes.algorithms();
+            for digest in revision.hashes() {
+                algorithms.push(digest.algorithm());
+            }
+            algorithms.sort();
+            algorithms.dedup();
+            algorithms
+        };
+
+        let hashes = self
+            .persist_archive(&resource.path, resource.ext, entry.path(), &algorithms)
+            .await?;
+        for existing in revision.hashes() {
+            if !hashes.contains(existing) {
+                return Err(Error::CacheHeal(source.to_string(), existing.algorithm()));
+            }
+        }
+        Ok(revision.with_hashes(HashDigests::from(hashes)))
+    }
+
+    /// Heal a [`Revision`] for a remote archive.
+    async fn heal_url_revision(
+        &self,
+        source: &BuildableSource<'_>,
+        ext: SourceDistExtension,
+        url: &Url,
+        entry: &CacheEntry,
+        revision: Revision,
+        hashes: HashPolicy<'_>,
+        client: &ManagedClient<'_>,
+    ) -> Result<Revision, Error> {
+        warn!("Re-downloading missing source distribution: {source}");
+        let cache_entry = entry.shard().entry(HTTP_REVISION);
+        let download = |response| {
+            async {
+                // Take the union of the requested and existing hash algorithms.
+                let algorithms = {
+                    let mut algorithms = hashes.algorithms();
+                    for digest in revision.hashes() {
+                        algorithms.push(digest.algorithm());
+                    }
+                    algorithms.sort();
+                    algorithms.dedup();
+                    algorithms
+                };
+
+                let hashes = self
+                    .download_archive(response, source, ext, entry.path(), &algorithms)
+                    .await?;
+                for existing in revision.hashes() {
+                    if !hashes.contains(existing) {
+                        return Err(Error::CacheHeal(source.to_string(), existing.algorithm()));
+                    }
+                }
+                Ok(revision.clone().with_hashes(HashDigests::from(hashes)))
+            }
+            .boxed_local()
+            .instrument(info_span!("download", source_dist = %source))
+        };
+        client
+            .managed(|client| async move {
+                client
+                    .cached_client()
+                    .skip_cache_with_retry(
+                        Self::request(url.clone(), client)?,
+                        &cache_entry,
+                        download,
+                    )
+                    .await
+                    .map_err(|err| match err {
+                        CachedClientError::Callback(err) => err,
+                        CachedClientError::Client(err) => Error::Client(err),
+                    })
+            })
+            .await
     }
 
     /// Download and unzip a source distribution into the cache from an HTTP response.
@@ -1351,10 +2039,9 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         &self,
         response: Response,
         source: &BuildableSource<'_>,
-        filename: &str,
         ext: SourceDistExtension,
         target: &Path,
-        hashes: HashPolicy<'_>,
+        algorithms: &[HashAlgorithm],
     ) -> Result<Vec<HashDigest>, Error> {
         let temp_dir = tempfile::tempdir_in(
             self.build_context
@@ -1368,17 +2055,20 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             .into_async_read();
 
         // Create a hasher for each hash algorithm.
-        let algorithms = hashes.algorithms();
-        let mut hashers = algorithms.into_iter().map(Hasher::from).collect::<Vec<_>>();
+        let mut hashers = algorithms
+            .iter()
+            .copied()
+            .map(Hasher::from)
+            .collect::<Vec<_>>();
         let mut hasher = uv_extract::hash::HashReader::new(reader.compat(), &mut hashers);
 
         // Download and unzip the source distribution into a temporary directory.
-        let span = info_span!("download_source_dist", filename = filename, source_dist = %source);
+        let span = info_span!("download_source_dist", source_dist = %source);
         uv_extract::stream::archive(&mut hasher, ext, temp_dir.path()).await?;
         drop(span);
 
         // If necessary, exhaust the reader to compute the hash.
-        if !hashes.is_none() {
+        if !algorithms.is_empty() {
             hasher.finish().await.map_err(Error::HashExhaustion)?;
         }
 
@@ -1395,9 +2085,14 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         fs_err::tokio::create_dir_all(target.parent().expect("Cache entry to have parent"))
             .await
             .map_err(Error::CacheWrite)?;
-        rename_with_retry(extracted, target)
-            .await
-            .map_err(Error::CacheWrite)?;
+        if let Err(err) = rename_with_retry(extracted, target).await {
+            // If the directory already exists, accept it.
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                warn!("Directory already exists: {}", target.display());
+            } else {
+                return Err(Error::CacheWrite(err));
+            }
+        }
 
         Ok(hashes)
     }
@@ -1408,7 +2103,7 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         path: &Path,
         ext: SourceDistExtension,
         target: &Path,
-        hashes: HashPolicy<'_>,
+        algorithms: &[HashAlgorithm],
     ) -> Result<Vec<HashDigest>, Error> {
         debug!("Unpacking for build: {}", path.display());
 
@@ -1423,15 +2118,18 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             .map_err(Error::CacheRead)?;
 
         // Create a hasher for each hash algorithm.
-        let algorithms = hashes.algorithms();
-        let mut hashers = algorithms.into_iter().map(Hasher::from).collect::<Vec<_>>();
+        let mut hashers = algorithms
+            .iter()
+            .copied()
+            .map(Hasher::from)
+            .collect::<Vec<_>>();
         let mut hasher = uv_extract::hash::HashReader::new(reader, &mut hashers);
 
         // Unzip the archive into a temporary directory.
         uv_extract::stream::archive(&mut hasher, ext, &temp_dir.path()).await?;
 
         // If necessary, exhaust the reader to compute the hash.
-        if !hashes.is_none() {
+        if !algorithms.is_empty() {
             hasher.finish().await.map_err(Error::HashExhaustion)?;
         }
 
@@ -1448,9 +2146,14 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         fs_err::tokio::create_dir_all(target.parent().expect("Cache entry to have parent"))
             .await
             .map_err(Error::CacheWrite)?;
-        rename_with_retry(extracted, &target)
-            .await
-            .map_err(Error::CacheWrite)?;
+        if let Err(err) = rename_with_retry(extracted, target).await {
+            // If the directory already exists, accept it.
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                warn!("Directory already exists: {}", target.display());
+            } else {
+                return Err(Error::CacheWrite(err));
+            }
+        }
 
         Ok(hashes)
     }
@@ -1465,7 +2168,8 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         source_root: &Path,
         subdirectory: Option<&Path>,
         cache_shard: &CacheShard,
-    ) -> Result<(String, WheelFilename, Metadata23), Error> {
+        source_strategy: SourceStrategy,
+    ) -> Result<(String, WheelFilename, ResolutionMetadata), Error> {
         debug!("Building: {source}");
 
         // Guard against build of source distributions when disabled.
@@ -1481,36 +2185,75 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             }
         }
 
+        // Build into a temporary directory, to prevent partial builds.
+        let temp_dir = self
+            .build_context
+            .cache()
+            .build_dir()
+            .map_err(Error::CacheWrite)?;
+
         // Build the wheel.
         fs::create_dir_all(&cache_shard)
             .await
             .map_err(Error::CacheWrite)?;
-        let disk_filename = self
+        // Try a direct build if that isn't disabled and the uv build backend is used.
+        let disk_filename = if let Some(name) = self
             .build_context
-            .setup_build(
+            .direct_build(
                 source_root,
                 subdirectory,
-                Some(source.to_string()),
-                source.as_dist(),
+                temp_dir.path(),
                 if source.is_editable() {
                     BuildKind::Editable
                 } else {
                     BuildKind::Wheel
                 },
-                BuildOutput::Debug,
+                Some(&source.to_string()),
             )
             .await
-            .map_err(Error::Build)?
-            .wheel(cache_shard)
-            .await
-            .map_err(Error::Build)?;
+            .map_err(|err| Error::Build(err.into()))?
+        {
+            // In the uv build backend, the normalized filename and the disk filename are the same.
+            name.to_string()
+        } else {
+            self.build_context
+                .setup_build(
+                    source_root,
+                    subdirectory,
+                    source_root,
+                    Some(&source.to_string()),
+                    source.as_dist(),
+                    source_strategy,
+                    if source.is_editable() {
+                        BuildKind::Editable
+                    } else {
+                        BuildKind::Wheel
+                    },
+                    BuildOutput::Debug,
+                    self.build_stack.cloned().unwrap_or_default(),
+                )
+                .await
+                .map_err(|err| Error::Build(err.into()))?
+                .wheel(temp_dir.path())
+                .await
+                .map_err(Error::Build)?
+        };
 
         // Read the metadata from the wheel.
         let filename = WheelFilename::from_str(&disk_filename)?;
-        let metadata = read_wheel_metadata(&filename, &cache_shard.join(&disk_filename))?;
+        let metadata = read_wheel_metadata(&filename, &temp_dir.path().join(&disk_filename))?;
 
         // Validate the metadata.
-        validate(source, &metadata)?;
+        validate_metadata(source, &metadata)?;
+        validate_filename(&filename, &metadata)?;
+
+        // Move the wheel to the cache.
+        rename_with_retry(
+            temp_dir.path().join(&disk_filename),
+            cache_shard.join(&disk_filename),
+        )
+        .await
+        .map_err(Error::CacheWrite)?;
 
         debug!("Finished building: {source}");
         Ok((disk_filename, filename, metadata))
@@ -1523,8 +2266,30 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         source: &BuildableSource<'_>,
         source_root: &Path,
         subdirectory: Option<&Path>,
-    ) -> Result<Option<Metadata23>, Error> {
+        source_strategy: SourceStrategy,
+    ) -> Result<Option<ResolutionMetadata>, Error> {
         debug!("Preparing metadata for: {source}");
+
+        // Ensure that the _installed_ Python version is compatible with the `requires-python`
+        // specifier.
+        if let Some(requires_python) = source.requires_python() {
+            let installed = self.build_context.interpreter().python_version();
+            let target = release_specifiers_to_ranges(requires_python.clone())
+                .bounding_range()
+                .map(|bounding_range| bounding_range.0.cloned())
+                .unwrap_or(Bound::Unbounded);
+            let is_compatible = match target {
+                Bound::Included(target) => *installed >= target,
+                Bound::Excluded(target) => *installed > target,
+                Bound::Unbounded => true,
+            };
+            if !is_compatible {
+                return Err(Error::RequiresPython(
+                    requires_python.clone(),
+                    installed.clone(),
+                ));
+            }
+        }
 
         // Set up the builder.
         let mut builder = self
@@ -1532,17 +2297,20 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
             .setup_build(
                 source_root,
                 subdirectory,
-                Some(source.to_string()),
+                source_root,
+                Some(&source.to_string()),
                 source.as_dist(),
+                source_strategy,
                 if source.is_editable() {
                     BuildKind::Editable
                 } else {
                     BuildKind::Wheel
                 },
                 BuildOutput::Debug,
+                self.build_stack.cloned().unwrap_or_default(),
             )
             .await
-            .map_err(Error::Build)?;
+            .map_err(|err| Error::Build(err.into()))?;
 
         // Build the metadata.
         let dist_info = builder.metadata().await.map_err(Error::Build)?;
@@ -1555,104 +2323,12 @@ impl<'a, T: BuildContext> SourceDistributionBuilder<'a, T> {
         let content = fs::read(dist_info.join("METADATA"))
             .await
             .map_err(Error::CacheRead)?;
-        let metadata = Metadata23::parse_metadata(&content)?;
+        let metadata = ResolutionMetadata::parse_metadata(&content)?;
 
         // Validate the metadata.
-        validate(source, &metadata)?;
+        validate_metadata(source, &metadata)?;
 
         Ok(Some(metadata))
-    }
-
-    async fn read_static_metadata(
-        source: &BuildableSource<'_>,
-        source_root: &Path,
-        subdirectory: Option<&Path>,
-    ) -> Result<Option<Metadata23>, Error> {
-        // Attempt to read static metadata from the `pyproject.toml`.
-        match read_pyproject_toml(source_root, subdirectory).await {
-            Ok(metadata) => {
-                debug!("Found static `pyproject.toml` for: {source}");
-
-                // Validate the metadata.
-                validate(source, &metadata)?;
-
-                return Ok(Some(metadata));
-            }
-            Err(
-                err @ (Error::MissingPyprojectToml
-                | Error::PyprojectToml(
-                    pypi_types::MetadataError::Pep508Error(_)
-                    | pypi_types::MetadataError::DynamicField(_)
-                    | pypi_types::MetadataError::FieldNotFound(_)
-                    | pypi_types::MetadataError::PoetrySyntax,
-                )),
-            ) => {
-                debug!("No static `pyproject.toml` available for: {source} ({err:?})");
-            }
-            Err(err) => return Err(err),
-        }
-
-        // If the source distribution is a source tree, avoid reading `PKG-INFO` or `egg-info`,
-        // since they could be out-of-date.
-        if source.is_source_tree() {
-            return Ok(None);
-        }
-
-        // Attempt to read static metadata from the `PKG-INFO` file.
-        match read_pkg_info(source_root, subdirectory).await {
-            Ok(metadata) => {
-                debug!("Found static `PKG-INFO` for: {source}");
-
-                // Validate the metadata.
-                validate(source, &metadata)?;
-
-                return Ok(Some(metadata));
-            }
-            Err(
-                err @ (Error::MissingPkgInfo
-                | Error::PkgInfo(
-                    pypi_types::MetadataError::Pep508Error(_)
-                    | pypi_types::MetadataError::DynamicField(_)
-                    | pypi_types::MetadataError::FieldNotFound(_)
-                    | pypi_types::MetadataError::UnsupportedMetadataVersion(_),
-                )),
-            ) => {
-                debug!("No static `PKG-INFO` available for: {source} ({err:?})");
-            }
-            Err(err) => return Err(err),
-        }
-
-        // Attempt to read static metadata from the `egg-info` directory.
-        match read_egg_info(source_root, subdirectory).await {
-            Ok(metadata) => {
-                debug!("Found static `egg-info` for: {source}");
-
-                // Validate the metadata.
-                validate(source, &metadata)?;
-
-                return Ok(Some(metadata));
-            }
-            Err(
-                err @ (Error::MissingEggInfo
-                | Error::MissingRequiresTxt
-                | Error::MissingPkgInfo
-                | Error::RequiresTxt(
-                    pypi_types::MetadataError::Pep508Error(_)
-                    | pypi_types::MetadataError::RequiresTxtContents(_),
-                )
-                | Error::PkgInfo(
-                    pypi_types::MetadataError::Pep508Error(_)
-                    | pypi_types::MetadataError::DynamicField(_)
-                    | pypi_types::MetadataError::FieldNotFound(_)
-                    | pypi_types::MetadataError::UnsupportedMetadataVersion(_),
-                )),
-            ) => {
-                debug!("No static `egg-info` available for: {source} ({err:?})");
-            }
-            Err(err) => return Err(err),
-        }
-
-        Ok(None)
     }
 
     /// Returns a GET [`reqwest::Request`] for the given URL.
@@ -1688,8 +2364,7 @@ pub fn prune(cache: &Cache) -> Result<Removal, Error> {
             // directories.
             let revision = entry.path().join("revision.http");
             if revision.is_file() {
-                let pointer = HttpRevisionPointer::read_from(revision)?;
-                if let Some(pointer) = pointer {
+                if let Ok(Some(pointer)) = HttpRevisionPointer::read_from(revision) {
                     // Remove all sibling directories that are not referenced by the pointer.
                     for sibling in entry.path().read_dir().map_err(Error::CacheRead)? {
                         let sibling = sibling.map_err(Error::CacheRead)?;
@@ -1714,8 +2389,7 @@ pub fn prune(cache: &Cache) -> Result<Removal, Error> {
             // directories.
             let revision = entry.path().join("revision.rev");
             if revision.is_file() {
-                let pointer = LocalRevisionPointer::read_from(revision)?;
-                if let Some(pointer) = pointer {
+                if let Ok(Some(pointer)) = LocalRevisionPointer::read_from(revision) {
                     // Remove all sibling directories that are not referenced by the pointer.
                     for sibling in entry.path().read_dir().map_err(Error::CacheRead)? {
                         let sibling = sibling.map_err(Error::CacheRead)?;
@@ -1741,11 +2415,159 @@ pub fn prune(cache: &Cache) -> Result<Removal, Error> {
     Ok(removal)
 }
 
+/// The result of extracting statically available metadata from a source distribution.
+#[derive(Debug)]
+enum StaticMetadata {
+    /// The metadata was found and successfully read.
+    Some(ResolutionMetadata),
+    /// The metadata was found, but it was ignored due to a dynamic version.
+    Dynamic,
+    /// The metadata was not found.
+    None,
+}
+
+impl StaticMetadata {
+    /// Read the [`ResolutionMetadata`] from a source distribution.
+    async fn read(
+        source: &BuildableSource<'_>,
+        source_root: &Path,
+        subdirectory: Option<&Path>,
+    ) -> Result<Self, Error> {
+        // Attempt to read the `pyproject.toml`.
+        let pyproject_toml = match read_pyproject_toml(source_root, subdirectory).await {
+            Ok(pyproject_toml) => Some(pyproject_toml),
+            Err(Error::MissingPyprojectToml) => {
+                debug!("No `pyproject.toml` available for: {source}");
+                None
+            }
+            Err(err) => return Err(err),
+        };
+
+        // Determine whether the version is static or dynamic.
+        let dynamic = pyproject_toml.as_ref().is_some_and(|pyproject_toml| {
+            pyproject_toml.project.as_ref().is_some_and(|project| {
+                project
+                    .dynamic
+                    .as_ref()
+                    .is_some_and(|dynamic| dynamic.iter().any(|field| field == "version"))
+            })
+        });
+
+        // Attempt to read static metadata from the `pyproject.toml`.
+        if let Some(pyproject_toml) = pyproject_toml {
+            match ResolutionMetadata::parse_pyproject_toml(pyproject_toml, source.version()) {
+                Ok(metadata) => {
+                    debug!("Found static `pyproject.toml` for: {source}");
+
+                    // Validate the metadata, but ignore it if the metadata doesn't match.
+                    match validate_metadata(source, &metadata) {
+                        Ok(()) => {
+                            return Ok(Self::Some(metadata));
+                        }
+                        Err(err) => {
+                            debug!("Ignoring `pyproject.toml` for {source}: {err}");
+                        }
+                    }
+                }
+                Err(
+                    err @ (uv_pypi_types::MetadataError::Pep508Error(_)
+                    | uv_pypi_types::MetadataError::DynamicField(_)
+                    | uv_pypi_types::MetadataError::FieldNotFound(_)
+                    | uv_pypi_types::MetadataError::PoetrySyntax),
+                ) => {
+                    debug!("No static `pyproject.toml` available for: {source} ({err:?})");
+                }
+                Err(err) => return Err(Error::PyprojectToml(err)),
+            }
+        }
+
+        // If the source distribution is a source tree, avoid reading `PKG-INFO`, since it could be
+        // out-of-date.
+        if source.is_source_tree() {
+            return Ok(if dynamic { Self::Dynamic } else { Self::None });
+        }
+
+        // Attempt to read static metadata from the `PKG-INFO` file.
+        match read_pkg_info(source_root, subdirectory).await {
+            Ok(metadata) => {
+                debug!("Found static `PKG-INFO` for: {source}");
+
+                // Validate the metadata, but ignore it if the metadata doesn't match.
+                match validate_metadata(source, &metadata) {
+                    Ok(()) => {
+                        // If necessary, mark the metadata as dynamic.
+                        let metadata = if dynamic {
+                            ResolutionMetadata {
+                                dynamic: true,
+                                ..metadata
+                            }
+                        } else {
+                            metadata
+                        };
+                        return Ok(Self::Some(metadata));
+                    }
+                    Err(err) => {
+                        debug!("Ignoring `PKG-INFO` for {source}: {err}");
+                    }
+                }
+            }
+            Err(
+                err @ (Error::MissingPkgInfo
+                | Error::PkgInfo(
+                    uv_pypi_types::MetadataError::Pep508Error(_)
+                    | uv_pypi_types::MetadataError::DynamicField(_)
+                    | uv_pypi_types::MetadataError::FieldNotFound(_)
+                    | uv_pypi_types::MetadataError::UnsupportedMetadataVersion(_),
+                )),
+            ) => {
+                debug!("No static `PKG-INFO` available for: {source} ({err:?})");
+            }
+            Err(err) => return Err(err),
+        }
+
+        Ok(Self::None)
+    }
+}
+
+/// Returns `true` if a `pyproject.toml` has `tool.uv.sources`.
+fn has_sources(content: &str) -> Result<bool, toml::de::Error> {
+    #[derive(serde::Deserialize)]
+    struct PyProjectToml {
+        tool: Option<Tool>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Tool {
+        uv: Option<ToolUv>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ToolUv {
+        sources: Option<ToolUvSources>,
+    }
+
+    let PyProjectToml { tool } = toml::from_str(content)?;
+    if let Some(tool) = tool {
+        if let Some(uv) = tool.uv {
+            if let Some(sources) = uv.sources {
+                if !sources.inner().is_empty() {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 /// Validate that the source distribution matches the built metadata.
-fn validate(source: &BuildableSource<'_>, metadata: &Metadata23) -> Result<(), Error> {
+fn validate_metadata(
+    source: &BuildableSource<'_>,
+    metadata: &ResolutionMetadata,
+) -> Result<(), Error> {
     if let Some(name) = source.name() {
         if metadata.name != *name {
-            return Err(Error::NameMismatch {
+            return Err(Error::WheelMetadataNameMismatch {
                 metadata: metadata.name.clone(),
                 given: name.clone(),
             });
@@ -1753,12 +2575,31 @@ fn validate(source: &BuildableSource<'_>, metadata: &Metadata23) -> Result<(), E
     }
 
     if let Some(version) = source.version() {
-        if metadata.version != *version {
-            return Err(Error::VersionMismatch {
+        if *version != metadata.version && *version != metadata.version.clone().without_local() {
+            return Err(Error::WheelMetadataVersionMismatch {
                 metadata: metadata.version.clone(),
                 given: version.clone(),
             });
         }
+    }
+
+    Ok(())
+}
+
+/// Validate that the source distribution matches the built filename.
+fn validate_filename(filename: &WheelFilename, metadata: &ResolutionMetadata) -> Result<(), Error> {
+    if metadata.name != filename.name {
+        return Err(Error::WheelFilenameNameMismatch {
+            metadata: metadata.name.clone(),
+            filename: filename.name.clone(),
+        });
+    }
+
+    if metadata.version != filename.version {
+        return Err(Error::WheelFilenameVersionMismatch {
+            metadata: metadata.version.clone(),
+            filename: filename.version.clone(),
+        });
     }
 
     Ok(())
@@ -1839,112 +2680,13 @@ impl LocalRevisionPointer {
     }
 }
 
-/// Read the [`Metadata23`] by combining a source distribution's `PKG-INFO` file with a
-/// `requires.txt`.
-///
-/// `requires.txt` is a legacy concept from setuptools. For example, here's
-/// `Flask.egg-info/requires.txt` from Flask's 1.0 release:
-///
-/// ```txt
-/// Werkzeug>=0.14
-/// Jinja2>=2.10
-/// itsdangerous>=0.24
-/// click>=5.1
-///
-/// [dev]
-/// pytest>=3
-/// coverage
-/// tox
-/// sphinx
-/// pallets-sphinx-themes
-/// sphinxcontrib-log-cabinet
-///
-/// [docs]
-/// sphinx
-/// pallets-sphinx-themes
-/// sphinxcontrib-log-cabinet
-///
-/// [dotenv]
-/// python-dotenv
-/// ```
-///
-/// See: <https://setuptools.pypa.io/en/latest/deprecated/python_eggs.html#dependency-metadata>
-async fn read_egg_info(
-    source_tree: &Path,
-    subdirectory: Option<&Path>,
-) -> Result<Metadata23, Error> {
-    fn find_egg_info(source_tree: &Path) -> std::io::Result<Option<PathBuf>> {
-        for entry in fs_err::read_dir(source_tree)? {
-            let entry = entry?;
-            let ty = entry.file_type()?;
-            if ty.is_dir() {
-                let path = entry.path();
-                if path
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("egg-info"))
-                {
-                    return Ok(Some(path));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    let directory = match subdirectory {
-        Some(subdirectory) => Cow::Owned(source_tree.join(subdirectory)),
-        None => Cow::Borrowed(source_tree),
-    };
-
-    // Locate the `egg-info` directory.
-    let egg_info = match find_egg_info(directory.as_ref()) {
-        Ok(Some(path)) => path,
-        Ok(None) => return Err(Error::MissingEggInfo),
-        Err(err) => return Err(Error::CacheRead(err)),
-    };
-
-    // Read the `requires.txt`.
-    let requires_txt = egg_info.join("requires.txt");
-    let content = match fs::read(requires_txt).await {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(Error::MissingRequiresTxt);
-        }
-        Err(err) => return Err(Error::CacheRead(err)),
-    };
-
-    // Parse the `requires.txt.
-    let requires_txt = RequiresTxt::parse(&content).map_err(Error::RequiresTxt)?;
-
-    // Read the `PKG-INFO` file.
-    let pkg_info = egg_info.join("PKG-INFO");
-    let content = match fs::read(pkg_info).await {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(Error::MissingPkgInfo);
-        }
-        Err(err) => return Err(Error::CacheRead(err)),
-    };
-
-    // Parse the metadata.
-    let metadata = Metadata12::parse_metadata(&content).map_err(Error::PkgInfo)?;
-
-    // Combine the sources.
-    Ok(Metadata23 {
-        name: metadata.name,
-        version: metadata.version,
-        requires_python: metadata.requires_python,
-        requires_dist: requires_txt.requires_dist,
-        provides_extras: requires_txt.provides_extras,
-    })
-}
-
-/// Read the [`Metadata23`] from a source distribution's `PKG-INFO` file, if it uses Metadata 2.2
+/// Read the [`ResolutionMetadata`] from a source distribution's `PKG-INFO` file, if it uses Metadata 2.2
 /// or later _and_ none of the required fields (`Requires-Python`, `Requires-Dist`, and
 /// `Provides-Extra`) are marked as dynamic.
 async fn read_pkg_info(
     source_tree: &Path,
     subdirectory: Option<&Path>,
-) -> Result<Metadata23, Error> {
+) -> Result<ResolutionMetadata, Error> {
     // Read the `PKG-INFO` file.
     let pkg_info = match subdirectory {
         Some(subdirectory) => source_tree.join(subdirectory).join("PKG-INFO"),
@@ -1959,17 +2701,17 @@ async fn read_pkg_info(
     };
 
     // Parse the metadata.
-    let metadata = Metadata23::parse_pkg_info(&content).map_err(Error::PkgInfo)?;
+    let metadata = ResolutionMetadata::parse_pkg_info(&content).map_err(Error::PkgInfo)?;
 
     Ok(metadata)
 }
 
-/// Read the [`Metadata23`] from a source distribution's `pyproject.toml` file, if it defines static
+/// Read the [`ResolutionMetadata`] from a source distribution's `pyproject.toml` file, if it defines static
 /// metadata consistent with PEP 621.
 async fn read_pyproject_toml(
     source_tree: &Path,
     subdirectory: Option<&Path>,
-) -> Result<Metadata23, Error> {
+) -> Result<PyProjectToml, Error> {
     // Read the `pyproject.toml` file.
     let pyproject_toml = match subdirectory {
         Some(subdirectory) => source_tree.join(subdirectory).join("pyproject.toml"),
@@ -1983,14 +2725,13 @@ async fn read_pyproject_toml(
         Err(err) => return Err(Error::CacheRead(err)),
     };
 
-    // Parse the metadata.
-    let metadata = Metadata23::parse_pyproject_toml(&content).map_err(Error::PyprojectToml)?;
+    let pyproject_toml = PyProjectToml::from_toml(&content)?;
 
-    Ok(metadata)
+    Ok(pyproject_toml)
 }
 
 /// Return the [`pypi_types::RequiresDist`] from a `pyproject.toml`, if it can be statically extracted.
-async fn read_requires_dist(project_root: &Path) -> Result<pypi_types::RequiresDist, Error> {
+async fn read_requires_dist(project_root: &Path) -> Result<uv_pypi_types::RequiresDist, Error> {
     // Read the `pyproject.toml` file.
     let pyproject_toml = project_root.join("pyproject.toml");
     let content = match fs::read_to_string(pyproject_toml).await {
@@ -2002,40 +2743,48 @@ async fn read_requires_dist(project_root: &Path) -> Result<pypi_types::RequiresD
     };
 
     // Parse the metadata.
-    let requires_dist =
-        pypi_types::RequiresDist::parse_pyproject_toml(&content).map_err(Error::PyprojectToml)?;
+    let requires_dist = uv_pypi_types::RequiresDist::parse_pyproject_toml(&content)
+        .map_err(Error::PyprojectToml)?;
 
     Ok(requires_dist)
 }
 
-/// Read an existing cached [`Metadata23`], if it exists.
-async fn read_cached_metadata(cache_entry: &CacheEntry) -> Result<Option<Metadata23>, Error> {
-    match fs::read(&cache_entry.path()).await {
-        Ok(cached) => Ok(Some(rmp_serde::from_slice(&cached)?)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(Error::CacheRead(err)),
+/// Wheel metadata stored in the source distribution cache.
+#[derive(Debug, Clone)]
+struct CachedMetadata(ResolutionMetadata);
+
+impl CachedMetadata {
+    /// Read an existing cached [`ResolutionMetadata`], if it exists.
+    async fn read(cache_entry: &CacheEntry) -> Result<Option<Self>, Error> {
+        match fs::read(&cache_entry.path()).await {
+            Ok(cached) => Ok(Some(Self(rmp_serde::from_slice(&cached)?))),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(Error::CacheRead(err)),
+        }
+    }
+
+    /// Returns `true` if the metadata matches the given package name and version.
+    fn matches(&self, name: Option<&PackageName>, version: Option<&Version>) -> bool {
+        name.is_none_or(|name| self.0.name == *name)
+            && version.is_none_or(|version| self.0.version == *version)
     }
 }
 
-/// Read the [`Metadata23`] from a built wheel.
-fn read_wheel_metadata(filename: &WheelFilename, wheel: &Path) -> Result<Metadata23, Error> {
+impl From<CachedMetadata> for ResolutionMetadata {
+    fn from(value: CachedMetadata) -> Self {
+        value.0
+    }
+}
+
+/// Read the [`ResolutionMetadata`] from a built wheel.
+fn read_wheel_metadata(
+    filename: &WheelFilename,
+    wheel: &Path,
+) -> Result<ResolutionMetadata, Error> {
     let file = fs_err::File::open(wheel).map_err(Error::CacheRead)?;
     let reader = std::io::BufReader::new(file);
     let mut archive = ZipArchive::new(reader)?;
     let dist_info = read_archive_metadata(filename, &mut archive)
         .map_err(|err| Error::WheelMetadata(wheel.to_path_buf(), Box::new(err)))?;
-    Ok(Metadata23::parse_metadata(&dist_info)?)
-}
-
-/// Apply an advisory lock to a [`CacheShard`] to prevent concurrent builds.
-async fn lock_shard(cache_shard: &CacheShard) -> Result<LockedFile, Error> {
-    let root = cache_shard.as_ref();
-
-    fs_err::create_dir_all(root).map_err(Error::CacheWrite)?;
-
-    let lock = LockedFile::acquire(root.join(".lock"), root.display())
-        .await
-        .map_err(Error::CacheWrite)?;
-
-    Ok(lock)
+    Ok(ResolutionMetadata::parse_metadata(&dist_info)?)
 }

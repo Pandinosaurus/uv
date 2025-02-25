@@ -1,9 +1,9 @@
 use core::fmt;
-
 use fs_err as fs;
 
-use pep440_rs::Version;
-use pep508_rs::{InvalidNameError, PackageName};
+use uv_dirs::user_executable_directory;
+use uv_pep440::Version;
+use uv_pep508::{InvalidNameError, PackageName};
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use fs_err::File;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use install_wheel_rs::read_record_file;
+use uv_install_wheel::read_record_file;
 
 pub use receipt::ToolReceipt;
 pub use tool::{Tool, ToolEntrypoint};
@@ -22,6 +22,7 @@ use uv_fs::{LockedFile, Simplified};
 use uv_installer::SitePackages;
 use uv_python::{Interpreter, PythonEnvironment};
 use uv_state::{StateBucket, StateStore};
+use uv_static::EnvVars;
 
 mod receipt;
 mod tool;
@@ -31,16 +32,14 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error("Failed to update `uv-receipt.toml` at {0}")]
-    ReceiptWrite(PathBuf, #[source] Box<toml::ser::Error>),
+    ReceiptWrite(PathBuf, #[source] Box<toml_edit::ser::Error>),
     #[error("Failed to read `uv-receipt.toml` at {0}")]
     ReceiptRead(PathBuf, #[source] Box<toml::de::Error>),
     #[error(transparent)]
     VirtualEnvError(#[from] uv_virtualenv::Error),
     #[error("Failed to read package entry points {0}")]
-    EntrypointRead(#[from] install_wheel_rs::Error),
-    #[error("Failed to find dist-info directory `{0}` in environment at {1}")]
-    DistInfoMissing(String, PathBuf),
-    #[error("Failed to find a directory for executables")]
+    EntrypointRead(#[from] uv_install_wheel::Error),
+    #[error("Failed to find a directory to install executables into")]
     NoExecutableDirectory,
     #[error(transparent)]
     ToolName(#[from] InvalidNameError),
@@ -52,8 +51,6 @@ pub enum Error {
     EnvironmentRead(PathBuf, String),
     #[error("Failed find package `{0}` in tool environment")]
     MissingToolPackage(PackageName),
-    #[error(transparent)]
-    Serialization(#[from] toml_edit::ser::Error),
 }
 
 /// A collection of uv-managed tools installed on the current system.
@@ -77,7 +74,7 @@ impl InstalledTools {
     /// 2. A directory in the system-appropriate user-level data directory, e.g., `~/.local/uv/tools`
     /// 3. A directory in the local data directory, e.g., `./.uv/tools`
     pub fn from_settings() -> Result<Self, Error> {
-        if let Some(tool_dir) = std::env::var_os("UV_TOOL_DIR") {
+        if let Some(tool_dir) = std::env::var_os(EnvVars::UV_TOOL_DIR) {
             Ok(Self::from_path(tool_dir))
         } else {
             Ok(Self::from_path(
@@ -158,7 +155,9 @@ impl InstalledTools {
             path.user_display()
         );
 
-        let doc = tool_receipt.to_toml()?;
+        let doc = tool_receipt
+            .to_toml()
+            .map_err(|err| Error::ReceiptWrite(path.clone(), Box::new(err)))?;
 
         // Save the modified `uv-receipt.toml`.
         fs_err::write(&path, doc)?;
@@ -182,6 +181,16 @@ impl InstalledTools {
             "Deleting environment for tool `{name}` at {}",
             environment_path.user_display()
         );
+
+        // On Windows, if the current executable is in the directory, guard against self-deletion.
+        #[cfg(windows)]
+        if let Ok(itself) = std::env::current_exe() {
+            let target = std::path::absolute(&environment_path)?;
+            if itself.starts_with(&target) {
+                debug!("Detected self-delete of executable: {}", itself.display());
+                self_replace::self_delete_outside_path(&environment_path)?;
+            }
+        }
 
         fs_err::remove_dir_all(environment_path)?;
 
@@ -213,10 +222,20 @@ impl InstalledTools {
             Err(uv_python::Error::Query(uv_python::InterpreterError::NotFound(
                 interpreter_path,
             ))) => {
-                warn!(
-                    "Ignoring existing virtual environment linked to non-existent Python interpreter: {}",
-                    interpreter_path.user_display()
-                );
+                if interpreter_path.is_symlink() {
+                    let target_path = fs_err::read_link(&interpreter_path)?;
+                    warn!(
+                        "Ignoring existing virtual environment linked to non-existent Python interpreter: {} -> {}",
+                        interpreter_path.user_display(),
+                        target_path.user_display()
+                    );
+                } else {
+                    warn!(
+                        "Ignoring existing virtual environment with missing Python interpreter: {}",
+                        interpreter_path.user_display()
+                    );
+                }
+
                 Ok(None)
             }
             Err(err) => Err(err.into()),
@@ -343,36 +362,9 @@ impl fmt::Display for InstalledTool {
     }
 }
 
-/// Find a directory to place executables in.
-///
-/// This follows, in order:
-///
-/// - `$UV_TOOL_BIN_DIR`
-/// - `$XDG_BIN_HOME`
-/// - `$XDG_DATA_HOME/../bin`
-/// - `$HOME/.local/bin`
-///
-/// On all platforms.
-///
-/// Errors if a directory cannot be found.
-pub fn find_executable_directory() -> Result<PathBuf, Error> {
-    std::env::var_os("UV_TOOL_BIN_DIR")
-        .and_then(dirs_sys::is_absolute_path)
-        .or_else(|| std::env::var_os("XDG_BIN_HOME").and_then(dirs_sys::is_absolute_path))
-        .or_else(|| {
-            std::env::var_os("XDG_DATA_HOME")
-                .and_then(dirs_sys::is_absolute_path)
-                .map(|path| path.join("../bin"))
-        })
-        .or_else(|| {
-            // See https://github.com/dirs-dev/dirs-rs/blob/50b50f31f3363b7656e5e63b3fa1060217cbc844/src/win.rs#L5C58-L5C78
-            #[cfg(windows)]
-            let home_dir = dirs_sys::known_folder_profile();
-            #[cfg(not(windows))]
-            let home_dir = dirs_sys::home_dir();
-            home_dir.map(|path| path.join(".local").join("bin"))
-        })
-        .ok_or(Error::NoExecutableDirectory)
+/// Find the tool executable directory.
+pub fn tool_executable_dir() -> Result<PathBuf, Error> {
+    user_executable_directory(Some(EnvVars::UV_TOOL_BIN_DIR)).ok_or(Error::NoExecutableDirectory)
 }
 
 /// Find the `.dist-info` directory for a package in an environment.
@@ -432,12 +424,11 @@ pub fn entrypoint_paths(
         };
 
         let absolute_path = layout.scheme.scripts.join(path_in_scripts);
-        let script_name = entry
-            .path
-            .rsplit(std::path::MAIN_SEPARATOR)
-            .next()
-            .unwrap_or(&entry.path)
-            .to_string();
+        let script_name = relative_path
+            .file_name()
+            .and_then(|filename| filename.to_str())
+            .map(ToString::to_string)
+            .unwrap_or(entry.path);
         entrypoints.push((script_name, absolute_path));
     }
 

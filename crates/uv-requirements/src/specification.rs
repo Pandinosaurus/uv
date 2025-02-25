@@ -32,25 +32,25 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use rustc_hash::FxHashSet;
 use tracing::instrument;
-
-use cache_key::CanonicalUrl;
-use distribution_types::{
-    FlatIndexLocation, IndexUrl, NameRequirementSpecification, UnresolvedRequirement,
-    UnresolvedRequirementSpecification,
-};
-use pep508_rs::{MarkerTree, UnnamedRequirement, UnnamedRequirementUrl};
-use pypi_types::Requirement;
-use pypi_types::VerbatimParsedUrl;
-use requirements_txt::{RequirementsTxt, RequirementsTxtRequirement};
+use uv_cache_key::CanonicalUrl;
 use uv_client::BaseClientBuilder;
 use uv_configuration::{NoBinary, NoBuild};
+use uv_distribution_types::{
+    IndexUrl, NameRequirementSpecification, UnresolvedRequirement,
+    UnresolvedRequirementSpecification,
+};
 use uv_fs::{Simplified, CWD};
 use uv_normalize::{ExtraName, PackageName};
+use uv_pep508::{MarkerTree, UnnamedRequirement, UnnamedRequirementUrl};
+use uv_pypi_types::Requirement;
+use uv_pypi_types::VerbatimParsedUrl;
+use uv_requirements_txt::{RequirementsTxt, RequirementsTxtRequirement};
+use uv_warnings::warn_user;
 use uv_workspace::pyproject::PyProjectToml;
 
 use crate::RequirementsSource;
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RequirementsSpecification {
     /// The name of the project specifying requirements.
     pub project: Option<PackageName>,
@@ -71,7 +71,7 @@ pub struct RequirementsSpecification {
     /// Whether to disallow index usage.
     pub no_index: bool,
     /// The `--find-links` locations to use for fetching packages.
-    pub find_links: Vec<FlatIndexLocation>,
+    pub find_links: Vec<IndexUrl>,
     /// The `--no-binary` flags to enforce when selecting distributions.
     pub no_binary: NoBinary,
     /// The `--no-build` flags to enforce when selecting distributions.
@@ -114,6 +114,18 @@ impl RequirementsSpecification {
                 }
 
                 let requirements_txt = RequirementsTxt::parse(path, &*CWD, client_builder).await?;
+
+                if requirements_txt == RequirementsTxt::default() {
+                    if path == Path::new("-") {
+                        warn_user!("No dependencies found in stdin");
+                    } else {
+                        warn_user!(
+                            "Requirements file `{}` does not contain any dependencies",
+                            path.user_display()
+                        );
+                    }
+                }
+
                 Self {
                     requirements: requirements_txt
                         .requirements
@@ -142,7 +154,7 @@ impl RequirementsSpecification {
                     find_links: requirements_txt
                         .find_links
                         .into_iter()
-                        .map(FlatIndexLocation::from)
+                        .map(IndexUrl::from)
                         .collect(),
                     no_binary: requirements_txt.no_binary,
                     no_build: requirements_txt.only_binary,
@@ -332,6 +344,46 @@ impl RequirementsSpecification {
     pub fn from_requirements(requirements: Vec<Requirement>) -> Self {
         Self {
             requirements: requirements
+                .into_iter()
+                .map(UnresolvedRequirementSpecification::from)
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Initialize a [`RequirementsSpecification`] from a list of [`Requirement`], including
+    /// constraints.
+    pub fn from_constraints(requirements: Vec<Requirement>, constraints: Vec<Requirement>) -> Self {
+        Self {
+            requirements: requirements
+                .into_iter()
+                .map(UnresolvedRequirementSpecification::from)
+                .collect(),
+            constraints: constraints
+                .into_iter()
+                .map(NameRequirementSpecification::from)
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Initialize a [`RequirementsSpecification`] from a list of [`Requirement`], including
+    /// constraints and overrides.
+    pub fn from_overrides(
+        requirements: Vec<Requirement>,
+        constraints: Vec<Requirement>,
+        overrides: Vec<Requirement>,
+    ) -> Self {
+        Self {
+            requirements: requirements
+                .into_iter()
+                .map(UnresolvedRequirementSpecification::from)
+                .collect(),
+            constraints: constraints
+                .into_iter()
+                .map(NameRequirementSpecification::from)
+                .collect(),
+            overrides: overrides
                 .into_iter()
                 .map(UnresolvedRequirementSpecification::from)
                 .collect(),

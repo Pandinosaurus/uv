@@ -1,10 +1,10 @@
 use uv_cache::Refresh;
 use uv_configuration::ConfigSettings;
 use uv_resolver::PrereleaseMode;
-use uv_settings::{PipOptions, ResolverInstallerOptions, ResolverOptions};
+use uv_settings::{Combine, PipOptions, ResolverInstallerOptions, ResolverOptions};
 
 use crate::{
-    BuildOptionsArgs, IndexArgs, InstallerArgs, Maybe, RefreshArgs, ResolverArgs,
+    BuildOptionsArgs, FetchArgs, IndexArgs, InstallerArgs, Maybe, RefreshArgs, ResolverArgs,
     ResolverInstallerArgs,
 };
 
@@ -39,10 +39,10 @@ impl From<ResolverArgs> for PipOptions {
             upgrade_package,
             index_strategy,
             keyring_provider,
-            allow_insecure_host,
             resolution,
             prerelease,
             pre,
+            fork_strategy,
             config_setting,
             no_build_isolation,
             no_build_isolation_package,
@@ -57,13 +57,8 @@ impl From<ResolverArgs> for PipOptions {
             upgrade_package: Some(upgrade_package),
             index_strategy,
             keyring_provider,
-            allow_insecure_host: allow_insecure_host.map(|allow_insecure_host| {
-                allow_insecure_host
-                    .into_iter()
-                    .filter_map(Maybe::into_option)
-                    .collect()
-            }),
             resolution,
+            fork_strategy,
             prerelease: if pre {
                 Some(PrereleaseMode::Allow)
             } else {
@@ -90,7 +85,6 @@ impl From<InstallerArgs> for PipOptions {
             reinstall_package,
             index_strategy,
             keyring_provider,
-            allow_insecure_host,
             config_setting,
             no_build_isolation,
             build_isolation,
@@ -106,12 +100,6 @@ impl From<InstallerArgs> for PipOptions {
             reinstall_package: Some(reinstall_package),
             index_strategy,
             keyring_provider,
-            allow_insecure_host: allow_insecure_host.map(|allow_insecure_host| {
-                allow_insecure_host
-                    .into_iter()
-                    .filter_map(Maybe::into_option)
-                    .collect()
-            }),
             config_settings: config_setting
                 .map(|config_settings| config_settings.into_iter().collect::<ConfigSettings>()),
             no_build_isolation: flag(no_build_isolation, build_isolation),
@@ -136,10 +124,10 @@ impl From<ResolverInstallerArgs> for PipOptions {
             reinstall_package,
             index_strategy,
             keyring_provider,
-            allow_insecure_host,
             resolution,
             prerelease,
             pre,
+            fork_strategy,
             config_setting,
             no_build_isolation,
             no_build_isolation_package,
@@ -158,18 +146,13 @@ impl From<ResolverInstallerArgs> for PipOptions {
             reinstall_package: Some(reinstall_package),
             index_strategy,
             keyring_provider,
-            allow_insecure_host: allow_insecure_host.map(|allow_insecure_host| {
-                allow_insecure_host
-                    .into_iter()
-                    .filter_map(Maybe::into_option)
-                    .collect()
-            }),
             resolution,
             prerelease: if pre {
                 Some(PrereleaseMode::Allow)
             } else {
                 prerelease
             },
+            fork_strategy,
             config_settings: config_setting
                 .map(|config_settings| config_settings.into_iter().collect::<ConfigSettings>()),
             no_build_isolation: flag(no_build_isolation, build_isolation),
@@ -183,9 +166,29 @@ impl From<ResolverInstallerArgs> for PipOptions {
     }
 }
 
+impl From<FetchArgs> for PipOptions {
+    fn from(args: FetchArgs) -> Self {
+        let FetchArgs {
+            index_args,
+            index_strategy,
+            keyring_provider,
+            exclude_newer,
+        } = args;
+
+        Self {
+            index_strategy,
+            keyring_provider,
+            exclude_newer,
+            ..PipOptions::from(index_args)
+        }
+    }
+}
+
 impl From<IndexArgs> for PipOptions {
     fn from(args: IndexArgs) -> Self {
         let IndexArgs {
+            default_index,
+            index,
             index_url,
             extra_index_url,
             no_index,
@@ -193,6 +196,12 @@ impl From<IndexArgs> for PipOptions {
         } = args;
 
         Self {
+            index: default_index
+                .and_then(Maybe::into_option)
+                .map(|default_index| vec![default_index])
+                .combine(
+                    index.map(|index| index.into_iter().filter_map(Maybe::into_option).collect()),
+                ),
             index_url: index_url.and_then(Maybe::into_option),
             extra_index_url: extra_index_url.map(|extra_index_urls| {
                 extra_index_urls
@@ -201,7 +210,12 @@ impl From<IndexArgs> for PipOptions {
                     .collect()
             }),
             no_index: if no_index { Some(true) } else { None },
-            find_links,
+            find_links: find_links.map(|find_links| {
+                find_links
+                    .into_iter()
+                    .filter_map(Maybe::into_option)
+                    .collect()
+            }),
             ..PipOptions::default()
         }
     }
@@ -219,10 +233,10 @@ pub fn resolver_options(
         upgrade_package,
         index_strategy,
         keyring_provider,
-        allow_insecure_host,
         resolution,
         prerelease,
         pre,
+        fork_strategy,
         config_setting,
         no_build_isolation,
         no_build_isolation_package,
@@ -242,9 +256,18 @@ pub fn resolver_options(
     } = build_args;
 
     ResolverOptions {
+        index: index_args
+            .default_index
+            .and_then(Maybe::into_option)
+            .map(|default_index| vec![default_index])
+            .combine(
+                index_args
+                    .index
+                    .map(|index| index.into_iter().filter_map(Maybe::into_option).collect()),
+            ),
         index_url: index_args.index_url.and_then(Maybe::into_option),
-        extra_index_url: index_args.extra_index_url.map(|extra_index_urls| {
-            extra_index_urls
+        extra_index_url: index_args.extra_index_url.map(|extra_index_url| {
+            extra_index_url
                 .into_iter()
                 .filter_map(Maybe::into_option)
                 .collect()
@@ -254,23 +277,23 @@ pub fn resolver_options(
         } else {
             None
         },
-        find_links: index_args.find_links,
-        upgrade: flag(upgrade, no_upgrade),
-        upgrade_package: Some(upgrade_package),
-        index_strategy,
-        keyring_provider,
-        allow_insecure_host: allow_insecure_host.map(|allow_insecure_host| {
-            allow_insecure_host
+        find_links: index_args.find_links.map(|find_links| {
+            find_links
                 .into_iter()
                 .filter_map(Maybe::into_option)
                 .collect()
         }),
+        upgrade: flag(upgrade, no_upgrade),
+        upgrade_package: Some(upgrade_package),
+        index_strategy,
+        keyring_provider,
         resolution,
         prerelease: if pre {
             Some(PrereleaseMode::Allow)
         } else {
             prerelease
         },
+        fork_strategy,
         dependency_metadata: None,
         config_settings: config_setting
             .map(|config_settings| config_settings.into_iter().collect::<ConfigSettings>()),
@@ -301,10 +324,10 @@ pub fn resolver_installer_options(
         reinstall_package,
         index_strategy,
         keyring_provider,
-        allow_insecure_host,
         resolution,
         prerelease,
         pre,
+        fork_strategy,
         config_setting,
         no_build_isolation,
         no_build_isolation_package,
@@ -325,10 +348,19 @@ pub fn resolver_installer_options(
         no_binary_package,
     } = build_args;
 
+    let default_index = index_args
+        .default_index
+        .and_then(Maybe::into_option)
+        .map(|default_index| vec![default_index]);
+    let index = index_args
+        .index
+        .map(|index| index.into_iter().filter_map(Maybe::into_option).collect());
+
     ResolverInstallerOptions {
+        index: default_index.combine(index),
         index_url: index_args.index_url.and_then(Maybe::into_option),
-        extra_index_url: index_args.extra_index_url.map(|extra_index_urls| {
-            extra_index_urls
+        extra_index_url: index_args.extra_index_url.map(|extra_index_url| {
+            extra_index_url
                 .into_iter()
                 .filter_map(Maybe::into_option)
                 .collect()
@@ -338,7 +370,12 @@ pub fn resolver_installer_options(
         } else {
             None
         },
-        find_links: index_args.find_links,
+        find_links: index_args.find_links.map(|find_links| {
+            find_links
+                .into_iter()
+                .filter_map(Maybe::into_option)
+                .collect()
+        }),
         upgrade: flag(upgrade, no_upgrade),
         upgrade_package: if upgrade_package.is_empty() {
             None
@@ -353,18 +390,13 @@ pub fn resolver_installer_options(
         },
         index_strategy,
         keyring_provider,
-        allow_insecure_host: allow_insecure_host.map(|allow_insecure_host| {
-            allow_insecure_host
-                .into_iter()
-                .filter_map(Maybe::into_option)
-                .collect()
-        }),
         resolution,
         prerelease: if pre {
             Some(PrereleaseMode::Allow)
         } else {
             prerelease
         },
+        fork_strategy,
         dependency_metadata: None,
         config_settings: config_setting
             .map(|config_settings| config_settings.into_iter().collect::<ConfigSettings>()),

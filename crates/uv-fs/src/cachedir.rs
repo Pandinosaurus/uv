@@ -3,7 +3,8 @@
 use std::io::Write;
 use std::{io, path};
 
-use cachedir::HEADER;
+/// The `CACHEDIR.TAG` file header as defined by the [specification](https://bford.info/cachedir/).
+const HEADER: &[u8; 43] = b"Signature: 8a477f597d28d172789f06886806bc55";
 
 /// Adds a tag to the specified `directory`.
 ///
@@ -32,9 +33,13 @@ pub fn add_tag<P: AsRef<path::Path>>(directory: P) -> io::Result<()> {
 /// Will return an error if The tag file doesn't exist and can't be created for any reason
 /// (the `directory` doesn't exist, permission error, can't write to the file etc.).
 pub fn ensure_tag<P: AsRef<path::Path>>(directory: P) -> io::Result<()> {
-    match add_tag(directory) {
+    match add_tag(&directory) {
         Err(e) => match e.kind() {
             io::ErrorKind::AlreadyExists => Ok(()),
+            // If it exists, but we can't write to it for some reason don't fail
+            io::ErrorKind::PermissionDenied if directory.as_ref().join("CACHEDIR.TAG").exists() => {
+                Ok(())
+            }
             _ => Err(e),
         },
         other => other,

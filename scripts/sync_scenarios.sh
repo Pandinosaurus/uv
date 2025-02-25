@@ -23,8 +23,9 @@ script_root="$(realpath "$(dirname "$0")")"
 
 cd "$script_root/scenarios"
 echo "Setting up a temporary environment..."
-uv venv
+uv venv -p 3.12
 
+# shellcheck disable=SC1091
 source ".venv/bin/activate"
 uv pip install -r requirements.txt --refresh-package packse
 

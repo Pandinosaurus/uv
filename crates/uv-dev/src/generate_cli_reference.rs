@@ -31,7 +31,6 @@ const SHOW_HIDDEN_COMMANDS: &[&str] = &["generate-shell-completion"];
 
 #[derive(clap::Args)]
 pub(crate) struct Args {
-    /// Write the generated output to stdout (rather than to `settings.md`).
     #[arg(long, default_value_t, value_enum)]
     pub(crate) mode: Mode,
 }
@@ -101,7 +100,14 @@ fn generate() -> String {
     generate_command(&mut output, &uv, &mut parents);
 
     for (value, replacement) in REPLACEMENTS {
-        output = output.replace(value, replacement);
+        assert_ne!(
+            value, replacement,
+            "`value` and `replacement` must be different, but both are `{value}`"
+        );
+        let before = &output;
+        let after = output.replace(value, replacement);
+        assert_ne!(*before, after, "Could not find `{value}` in the output");
+        output = after;
     }
 
     output
@@ -179,6 +185,8 @@ fn generate_command<'a>(output: &mut String, command: &'a Command, parents: &mut
 
     // Do not display options for commands with children
     if !has_subcommands {
+        let name_key = name.replace(' ', "-");
+
         // Display positional arguments
         let mut arguments = command
             .get_positionals()
@@ -190,10 +198,11 @@ fn generate_command<'a>(output: &mut String, command: &'a Command, parents: &mut
             output.push_str("<dl class=\"cli-reference\">");
 
             for arg in arguments {
-                output.push_str("<dt>");
+                let id = format!("{name_key}--{}", arg.get_id());
+                output.push_str(&format!("<dt id=\"{id}\">"));
                 output.push_str(&format!(
-                    "<code>{}</code>",
-                    arg.get_id().to_string().to_uppercase()
+                    "<a href=\"#{id}\"<code>{}</code></a>",
+                    arg.get_id().to_string().to_uppercase(),
                 ));
                 output.push_str("</dt>");
                 if let Some(help) = arg.get_long_help().or_else(|| arg.get_help()) {
@@ -219,9 +228,10 @@ fn generate_command<'a>(output: &mut String, command: &'a Command, parents: &mut
             output.push_str("<dl class=\"cli-reference\">");
             for opt in options {
                 let Some(long) = opt.get_long() else { continue };
+                let id = format!("{name_key}--{long}");
 
-                output.push_str("<dt>");
-                output.push_str(&format!("<code>--{long}</code>"));
+                output.push_str(&format!("<dt id=\"{id}\">"));
+                output.push_str(&format!("<a href=\"#{id}\"><code>--{long}</code></a>",));
                 if let Some(short) = opt.get_short() {
                     output.push_str(&format!(", <code>-{short}</code>"));
                 }
@@ -309,6 +319,7 @@ fn emit_possible_options(opt: &clap::Arg, output: &mut String) {
             "\nPossible values:\n{}",
             values
                 .into_iter()
+                .filter(|value| !value.is_hide_set())
                 .map(|value| {
                     let name = value.get_name();
                     value.get_help().map_or_else(
@@ -329,13 +340,15 @@ mod tests {
 
     use anyhow::Result;
 
+    use uv_static::EnvVars;
+
     use crate::generate_all::Mode;
 
     use super::{main, Args};
 
     #[test]
     fn test_generate_cli_reference() -> Result<()> {
-        let mode = if env::var("UV_UPDATE_SCHEMA").as_deref() == Ok("1") {
+        let mode = if env::var(EnvVars::UV_UPDATE_SCHEMA).as_deref() == Ok("1") {
             Mode::Write
         } else {
             Mode::Check

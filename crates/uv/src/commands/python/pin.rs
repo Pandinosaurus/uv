@@ -1,4 +1,5 @@
 use std::fmt::Write;
+use std::path::Path;
 use std::str::FromStr;
 
 use anyhow::{bail, Result};
@@ -6,10 +7,10 @@ use owo_colors::OwoColorize;
 use tracing::debug;
 
 use uv_cache::Cache;
-use uv_fs::{Simplified, CWD};
+use uv_fs::Simplified;
 use uv_python::{
     EnvironmentPreference, PythonInstallation, PythonPreference, PythonRequest, PythonVersionFile,
-    PYTHON_VERSION_FILENAME,
+    VersionFileDiscoveryOptions, PYTHON_VERSION_FILENAME,
 };
 use uv_warnings::warn_user_once;
 use uv_workspace::{DiscoveryOptions, VirtualProject};
@@ -19,6 +20,7 @@ use crate::printer::Printer;
 
 /// Pin to a specific Python version.
 pub(crate) async fn pin(
+    project_dir: &Path,
     request: Option<String>,
     resolved: bool,
     python_preference: PythonPreference,
@@ -29,7 +31,7 @@ pub(crate) async fn pin(
     let virtual_project = if no_project {
         None
     } else {
-        match VirtualProject::discover(&CWD, &DiscoveryOptions::default()).await {
+        match VirtualProject::discover(project_dir, &DiscoveryOptions::default()).await {
             Ok(virtual_project) => Some(virtual_project),
             Err(err) => {
                 debug!("Failed to discover virtual project: {err}");
@@ -38,7 +40,8 @@ pub(crate) async fn pin(
         }
     };
 
-    let version_file = PythonVersionFile::discover(&*CWD, false, false).await;
+    let version_file =
+        PythonVersionFile::discover(project_dir, &VersionFileDiscoveryOptions::default()).await;
 
     let Some(request) = request else {
         // Display the current pinned Python version
@@ -124,13 +127,15 @@ pub(crate) async fn pin(
 
     let existing = version_file.ok().flatten();
     // TODO(zanieb): Allow updating the discovered version file with an `--update` flag.
-    let new =
-        PythonVersionFile::new(CWD.join(PYTHON_VERSION_FILENAME)).with_versions(vec![request]);
+    let new = PythonVersionFile::new(project_dir.join(PYTHON_VERSION_FILENAME))
+        .with_versions(vec![request]);
 
     new.write().await?;
 
+    // If we updated an existing version file to a new version
     if let Some(existing) = existing
         .as_ref()
+        .filter(|existing| existing.path() == new.path())
         .and_then(PythonVersionFile::version)
         .filter(|version| *version != new.version().unwrap())
     {
@@ -153,7 +158,7 @@ pub(crate) async fn pin(
     Ok(ExitStatus::Success)
 }
 
-fn pep440_version_from_request(request: &PythonRequest) -> Option<pep440_rs::Version> {
+fn pep440_version_from_request(request: &PythonRequest) -> Option<uv_pep440::Version> {
     let version_request = match request {
         PythonRequest::Version(ref version)
         | PythonRequest::ImplementationVersion(_, ref version) => version,
@@ -163,12 +168,16 @@ fn pep440_version_from_request(request: &PythonRequest) -> Option<pep440_rs::Ver
         }
     };
 
-    if matches!(version_request, uv_python::VersionRequest::Range(_)) {
+    if matches!(version_request, uv_python::VersionRequest::Range(_, _)) {
         return None;
     }
 
-    // SAFETY: converting `VersionRequest` to `Version` is guaranteed to succeed if not a `Range`.
-    Some(pep440_rs::Version::from_str(&version_request.to_string()).unwrap())
+    // SAFETY: converting `VersionRequest` to `Version` is guaranteed to succeed if not a `Range`
+    // and does not have a Python variant (e.g., freethreaded) attached.
+    Some(
+        uv_pep440::Version::from_str(&version_request.clone().without_python_variant().to_string())
+            .unwrap(),
+    )
 }
 
 /// Check if pinned request is compatible with the workspace/project's `Requires-Python`.
@@ -194,8 +203,8 @@ fn warn_if_existing_pin_incompatible_with_project(
         }
     }
 
-    // If the there is not a version in the pinned request, attempt to resolve the pin into an interpreter
-    // to check for compatibility on the current system.
+    // If there is not a version in the pinned request, attempt to resolve the pin into an
+    // interpreter to check for compatibility on the current system.
     match PythonInstallation::find(
         pin,
         EnvironmentPreference::OnlySystem,
@@ -233,7 +242,7 @@ fn warn_if_existing_pin_incompatible_with_project(
 /// Utility struct for representing pins in error messages.
 struct Pin<'a> {
     request: &'a PythonRequest,
-    version: &'a pep440_rs::Version,
+    version: &'a uv_pep440::Version,
     resolved: bool,
     existing: bool,
 }

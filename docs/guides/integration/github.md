@@ -1,3 +1,10 @@
+---
+title: Using uv in GitHub Actions
+description:
+  A guide to using uv in GitHub Actions, including installation, setting up Python, installing
+  dependencies, and more.
+---
+
 # Using uv in GitHub Actions
 
 ## Installation
@@ -20,7 +27,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v2
+        uses: astral-sh/setup-uv@v5
 ```
 
 It is considered best practice to pin to a specific uv version, e.g., with:
@@ -37,10 +44,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v2
+        uses: astral-sh/setup-uv@v5
         with:
           # Install a specific version of uv.
-          version: "0.4.11"
+          version: "0.6.3"
 ```
 
 ## Setting up Python
@@ -59,44 +66,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v2
+        uses: astral-sh/setup-uv@v5
 
       - name: Set up Python
         run: uv python install
 ```
 
 This will respect the Python version pinned in the project.
-
-Or, when using a matrix, as in:
-
-```yaml title="example.yml"
-strategy:
-  matrix:
-    python-version:
-      - "3.10"
-      - "3.11"
-      - "3.12"
-```
-
-Provide the version to the `python install` invocation:
-
-```yaml title="example.yml" hl_lines="14 15"
-name: Example
-
-jobs:
-  uv-example:
-    name: python
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v2
-
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
-```
 
 Alternatively, the official GitHub `setup-python` action can be used. This can be faster, because
 GitHub caches the Python versions alongside the runner.
@@ -117,7 +93,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v2
+        uses: astral-sh/setup-uv@v5
 
       - name: "Set up Python"
         uses: actions/setup-python@v5
@@ -140,12 +116,58 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v2
+        uses: astral-sh/setup-uv@v5
 
       - name: "Set up Python"
         uses: actions/setup-python@v5
         with:
           python-version-file: "pyproject.toml"
+```
+
+## Multiple Python versions
+
+When using a matrix to test multiple Python versions, set the Python version using
+`astral-sh/setup-uv`, which will override the Python version specification in the `pyproject.toml`
+or `.python-version` files:
+
+```yaml title="example.yml" hl_lines="17 18"
+jobs:
+  build:
+    name: continuous-integration
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv and set the python version
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+```
+
+If not using the `setup-uv` action, you can set the `UV_PYTHON` environment variable:
+
+```yaml title="example.yml" hl_lines="12"
+jobs:
+  build:
+    name: continuous-integration
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v4
 ```
 
 ## Syncing and running
@@ -165,10 +187,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v2
-
-      - name: Set up Python
-        run: uv python install
+        uses: astral-sh/setup-uv@v5
 
       - name: Install the project
         run: uv sync --all-extras --dev
@@ -181,7 +200,7 @@ jobs:
 !!! tip
 
     The
-    [`UV_PROJECT_ENVIRONMENT` setting](../../concepts/projects.md#configuring-the-project-environment-path) can
+    [`UV_PROJECT_ENVIRONMENT` setting](../../concepts/projects/config.md#project-environment-path) can
     be used to install to the system Python environment instead of creating a virtual environment.
 
 ## Caching
@@ -193,7 +212,7 @@ persisting the cache:
 
 ```yaml title="example.yml"
 - name: Enable caching
-  uses: astral-sh/setup-uv@v2
+  uses: astral-sh/setup-uv@v5
   with:
     enable-cache: true
 ```
@@ -202,7 +221,7 @@ You can configure the action to use a custom cache directory on the runner:
 
 ```yaml title="example.yml"
 - name: Define a custom uv cache path
-  uses: astral-sh/setup-uv@v2
+  uses: astral-sh/setup-uv@v5
   with:
     enable-cache: true
     cache-local-path: "/path/to/cache"
@@ -212,7 +231,7 @@ Or invalidate it when the lockfile changes:
 
 ```yaml title="example.yml"
 - name: Define a cache dependency glob
-  uses: astral-sh/setup-uv@v2
+  uses: astral-sh/setup-uv@v5
   with:
     enable-cache: true
     cache-dependency-glob: "uv.lock"
@@ -222,7 +241,7 @@ Or when any requirements file changes:
 
 ```yaml title="example.yml"
 - name: Define a cache dependency glob
-  uses: astral-sh/setup-uv@v2
+  uses: astral-sh/setup-uv@v5
   with:
     enable-cache: true
     cache-dependency-glob: "requirements**.txt"
@@ -264,6 +283,30 @@ Its effect on performance is dependent on the packages being installed.
 !!! tip
 
     If using `uv pip`, use `requirements.txt` instead of `uv.lock` in the cache key.
+
+!!! note
+
+    [post-job-hook]: https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/running-scripts-before-or-after-a-job
+
+    When using non-ephemeral, self-hosted runners the default cache directory can grow unbounded.
+    In this case, it may not be optimal to share the cache between jobs. Instead, move the cache
+    inside the GitHub Workspace and remove it once the job finishes using a
+    [Post Job Hook][post-job-hook].
+
+    ```yaml
+    install_job:
+      env:
+        # Configure a relative location for the uv cache
+        UV_CACHE_DIR: ${{ github.workspace }}/.cache/uv
+    ```
+
+    Using a post job hook requires setting the `ACTIONS_RUNNER_HOOK_JOB_STARTED` environment
+    variable on the self-hosted runner to the path of a cleanup script such as the one shown below.
+
+    ```sh title="clean-uv-cache.sh"
+    #!/usr/bin/env sh
+    uv cache clean
+    ```
 
 ## Using `uv pip`
 

@@ -1,3 +1,10 @@
+---
+title: Working on projects
+description:
+  A guide to using uv to create and manage Python projects, including adding dependencies, running
+  commands, and building publishable distributions.
+---
+
 # Working on projects
 
 uv supports managing Python projects, which define their dependencies in a `pyproject.toml` file.
@@ -25,14 +32,14 @@ uv will create the following files:
 .
 ├── .python-version
 ├── README.md
-├── hello.py
+├── main.py
 └── pyproject.toml
 ```
 
-The `hello.py` file contains a simple "Hello world" program. Try it out with `uv run`:
+The `main.py` file contains a simple "Hello world" program. Try it out with `uv run`:
 
 ```console
-$ uv run hello.py
+$ uv run main.py
 Hello from hello-world!
 ```
 
@@ -53,7 +60,7 @@ A complete listing would look like:
 │   └── pyvenv.cfg
 ├── .python-version
 ├── README.md
-├── hello.py
+├── main.py
 ├── pyproject.toml
 └── uv.lock
 ```
@@ -93,8 +100,8 @@ Python version to use when creating the project's virtual environment.
 The `.venv` folder contains your project's virtual environment, a Python environment that is
 isolated from the rest of your system. This is where uv will install your project's dependencies.
 
-See the [project environment](../concepts/projects.md#project-environments) documentation for more
-details.
+See the [project environment](../concepts/projects/layout.md#the-project-environment) documentation
+for more details.
 
 ### `uv.lock`
 
@@ -106,7 +113,7 @@ reproducible installations across machines.
 
 `uv.lock` is a human-readable TOML file but is managed by uv and should not be edited manually.
 
-See the [lockfile](../concepts/projects.md#project-lockfile) documentation for more details.
+See the [lockfile](../concepts/projects/layout.md#the-lockfile) documentation for more details.
 
 ## Managing dependencies
 
@@ -124,7 +131,7 @@ $ # Specify a version constraint
 $ uv add 'requests==2.31.0'
 
 $ # Add a git dependency
-$ uv add requests --git https://github.com/psf/requests
+$ uv add git+https://github.com/psf/requests
 ```
 
 To remove a package, you can use `uv remove`:
@@ -133,8 +140,17 @@ To remove a package, you can use `uv remove`:
 $ uv remove requests
 ```
 
-See the documentation on [managing dependencies](../concepts/projects.md#managing-dependencies) for
-more details.
+To upgrade a package, run `uv lock` with the `--upgrade-package` flag:
+
+```console
+$ uv lock --upgrade-package requests
+```
+
+The `--upgrade-package` flag will attempt to update the specified package to the latest compatible
+version, while keeping the rest of the lockfile intact.
+
+See the documentation on [managing dependencies](../concepts/projects/dependencies.md) for more
+details.
 
 ## Running commands
 
@@ -168,19 +184,30 @@ $ uv run example.py
 Alternatively, you can use `uv sync` to manually update the environment then activate it before
 executing a command:
 
-```console
-$ uv sync
-$ source .venv/bin/activate
-$ flask run -p 3000
-$ python example.py
-```
+=== "macOS and Linux"
+
+    ```console
+    $ uv sync
+    $ source .venv/bin/activate
+    $ flask run -p 3000
+    $ python example.py
+    ```
+
+=== "Windows"
+
+    ```powershell
+    uv sync
+    source .venv\Scripts\activate
+    flask run -p 3000
+    python example.py
+    ```
 
 !!! note
 
     The virtual environment must be active to run scripts and commands in the project without `uv run`. Virtual environment activation differs per shell and platform.
 
-See the documentation on [running commands](../concepts/projects.md#running-commands) and
-[running scripts](../concepts/projects.md#running-scripts) in projects for more details.
+See the documentation on [running commands and scripts](../concepts/projects/run.md) in projects for
+more details.
 
 ## Building distributions
 
@@ -197,12 +224,12 @@ hello-world-0.1.0-py3-none-any.whl
 hello-world-0.1.0.tar.gz
 ```
 
-See the documentation on [building projects](../concepts/projects.md#building-projects) for more
-details.
+See the documentation on [building projects](../concepts/projects/build.md) for more details.
 
 ## Next steps
 
-To learn more about working on projects with uv, see the [Projects concept](../concepts/projects.md)
-page and the [command reference](../reference/cli.md#uv).
+To learn more about working on projects with uv, see the
+[projects concept](../concepts/projects/index.md) page and the
+[command reference](../reference/cli.md#uv).
 
-Or, read on to learn how to [publish your project as a package](./publish.md).
+Or, read on to learn how to [build and publish your project to a package index](./package.md).

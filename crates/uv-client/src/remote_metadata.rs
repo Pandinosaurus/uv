@@ -1,9 +1,9 @@
 use crate::{Error, ErrorKind};
 use async_http_range_reader::AsyncHttpRangeReader;
-use distribution_filename::WheelFilename;
 use futures::io::BufReader;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 use url::Url;
+use uv_distribution_filename::WheelFilename;
 use uv_metadata::find_archive_dist_info;
 
 /// Read the `.dist-info/METADATA` file from a async remote zip reader, so we avoid downloading the
@@ -85,7 +85,7 @@ pub(crate) async fn wheel_metadata_from_remote_zip(
     // The zip archive uses as BufReader which reads in chunks of 8192. To ensure we prefetch
     // enough data we round the size up to the nearest multiple of the buffer size.
     let buffer_size = 8192;
-    let size = ((size + buffer_size - 1) / buffer_size) * buffer_size;
+    let size = size.div_ceil(buffer_size) * buffer_size;
 
     // Fetch the bytes from the zip archive that contain the requested file.
     reader
